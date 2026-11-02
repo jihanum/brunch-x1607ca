@@ -1,45 +1,8 @@
 # brunch-unstable — Intel Lunar Lake (Xe2) fork
 
-A fork of [sebanc/brunch-unstable](https://github.com/sebanc/brunch-unstable) for recent
-Intel laptops that upstream brunch cannot run:
+A fork of [kk1987/brunch-lunar-lake](https://github.com/kk1987/brunch-lunar-lake)
 
-| platform | what this fork provides | tested |
-|---|---|---|
-| **Lunar Lake** (Core Ultra 200V, Xe2) | 7.1 kernel, Mesa 25.3.6 graphics, ARCVM fixes, SOF audio firmware | yes, one machine |
-| **Meteor Lake** (Core Ultra 100), **Arrow Lake** (Core Ultra 200H / U / S) | 7.1 kernel, SOF audio firmware — graphics already work with the ChromeOS image's own Mesa | no |
-
-Everyone else is better served by upstream brunch.
-
-**Status on Lunar Lake: it works.** OOBE, login, reboot, re-login, Play Store, Android
-apps and games, Crostini, audio and suspend all run on the reference machine, an
-**HP OmniBook X Flip** (Core Ultra 9 288V, Xe2 `8086:64A0`), with the **ChromeOS R149,
-R150, R151 and R154 volteer** recovery images. Other Lunar Lake machines should work — the
-Lunar Lake patches key off the iGPU PCI id (`8086:6420`, `8086:64a0`, `8086:64b0`), not
-off the laptop model — but none has been tried. See *Known limitations*.
-
-## Why upstream brunch does not run here
-
-Upstream ships kernels 6.6 / 6.12 (plus an experimental 6.18) and the graphics userspace
-inside the ChromeOS recovery image. Neither knows about Lunar Lake: the image carries Mesa older than
-25.2 (iris has no `I915_FORMAT_MOD_4_TILED_LNL_CCS`, minigbm has no `xe` backend), and
-brunch's kernel configs disable the Intel IOMMU, without which these machines do not
-boot. On all three platforms, no ChromeOS image carries IPC4 audio firmware recent and
-complete enough to give sound (see *Audio firmware*).
-
-## Installing
-
-Install as with upstream brunch and pick `7.1` in `brunch-setup` — release builds ship
-only that kernel, so it is the only entry. The patches activate on their own by iGPU
-PCI id; these options override them:
-
-| option | patch | default |
-|---|---|---|
-| `no_lnl_mesa` / `lnl_mesa` | Mesa override (`85-mesa_lnl.sh`) | on for Lunar Lake |
-| `no_sof_firmware` / `sof_firmware` | SOF firmware (`86-intel_sof_fw.sh`) | on for Lunar / Meteor / Arrow Lake |
-| `no_arcvm_seccomp` / `arcvm_seccomp` | crosvm seccomp shim (`87-arcvm_seccomp.sh`) | on for Lunar Lake |
-
-`no_lnl_audio_fw` / `lnl_audio_fw`, the names the firmware patch had while it covered only
-Lunar Lake, still work.
+Tested and patched for the ASUS Vivobook 16 (X1607CA model with Intel Ultra 200 Series CPU)
 
 ## What this fork adds
 
@@ -243,6 +206,10 @@ sudo mokutil --import brunch-lnl.der
 or at the blue "Verification failed" screen on the first Secure Boot boot: OK → Enroll
 key from disk → EFI-SYSTEM → select each `.der` in turn → Continue, reboot. With Secure
 Boot disabled none of this matters.
+
+## Specific patches for X1607CA
+- Add lnl_mesa=1 and arcvm_seccomp=1 to 0x7dd1/0x7d51; graphical acceleration and Android app support extended to Arrow Lake-specific IDs
+- Camera and microphone tested on ASUS X1607CA
 
 ## Known limitations
 
