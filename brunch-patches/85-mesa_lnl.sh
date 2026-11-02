@@ -18,7 +18,7 @@ for dev in /sys/bus/pci/devices/*; do
 	[ -f "$dev/vendor" ] || continue
 	if [ "$(cat "$dev/vendor")" == "0x8086" ]; then
 		case "$(cat "$dev/device")" in
-			0x6420|0x64a0|0x64b0|0x7dd1) lnl_mesa=1 ;;
+			0x6420|0x64a0|0x64b0|0x7dd1|0x7d51) lnl_mesa=1 ;;
 		esac
 	fi
 done
