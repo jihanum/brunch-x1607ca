@@ -1,8 +1,5 @@
 #!/bin/sh
 
-# Install Lunar Lake SOF microphone ALSA mixer & CRAS input watchdog service.
-# Runs during Brunch rootfs build; target ChromeOS rootfs is mounted at /roota.
-
 ret=0
 
 cp -a /roota/usr/sbin/chromeos-cleanup-logs /roota/usr/sbin/lnl-mic-daemon 2>/dev/null || true
@@ -31,7 +28,7 @@ while true; do
     if amixer -c 0 cget numid=49 2>/dev/null | grep -q "values=off"; then
         apply_mic_settings
     fi
-    if ! cras_test_client --dump_server_info 2>/dev/null | grep -E "12:0.*\*" >/dev/null; then
+    if ! cras_test_client --dump_server_info 2>/dev/null | grep -E "(12:0|USB|BLUETOOTH).*\*" >/dev/null; then
         cras_test_client --select_input 12:0 >/dev/null 2>&1 || true
     fi
     sleep 10
@@ -40,7 +37,7 @@ EOF
 chmod 0755 /roota/usr/sbin/lnl-mic-daemon
 if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 0))); fi
 
-cp -a /roota/etc/init/cras.conf /roota/etc/init/lnl-mic.conf
+cp -a /roota/etc/init/cras.conf /roota/etc/init/lnl-mic.conf 2>/dev/null || true
 cat > /roota/etc/init/lnl-mic.conf << 'EOF'
 description "Lunar Lake SOF microphone mixer and CRAS input watchdog"
 author "brunch-lunar-lake"
