@@ -3,6 +3,7 @@
 # Configure libgbm_m.so (for Lunar Lake / Arrow Lake Mesa) and libminigbm.so.1.0.0
 
 chroot /roota /bin/bash -s <<'EOF'
+set -o pipefail
 ret=0
 
 GBM_CUR="/usr/lib64/libgbm.so.1.0.0"
@@ -36,20 +37,35 @@ if [ -f "$GBM_CUR" ] && [ ! -L "$GBM_CUR" ]; then
 	fi
 fi
 
-for TARGET in "$EGL" "$DRI_GBM"; do
-	if [ -f "$TARGET" ]; then
-		chmod 0755 "$TARGET"
-		LC_ALL=C sed 's/libgbm\.so\.1\x00/libgbm_m.so\x00/g' "$TARGET" > "${TARGET}.tmp"
-		if [ "$?" -eq 0 ] && [ -s "${TARGET}.tmp" ]; then
-			cat "${TARGET}.tmp" > "$TARGET"
-			rm -f "${TARGET}.tmp"
-			restore_selinux_file "$REF_LIB" "$TARGET" "u:object_r:cros_system_file:s0"
-		else
-			rm -f "${TARGET}.tmp"
-			ret=$((ret + 2))
+# Only patch Mesa dependents and redirect libgbm symlinks if libgbm_m.so is present and non-empty
+if [ -s "$GBM_M" ] && [ -f "$MINI" ]; then
+	for TARGET in "$EGL" "$DRI_GBM"; do
+		if [ -f "$TARGET" ]; then
+			chmod 0755 "$TARGET"
+			LC_ALL=C sed 's/libgbm\.so\.1\x00/libgbm_m.so\x00/g' "$TARGET" > "${TARGET}.tmp"
+			if [ "$?" -eq 0 ] && [ -s "${TARGET}.tmp" ]; then
+				cat "${TARGET}.tmp" > "$TARGET"
+				rm -f "${TARGET}.tmp"
+				restore_selinux_file "$REF_LIB" "$TARGET" "u:object_r:cros_system_file:s0"
+			else
+				rm -f "${TARGET}.tmp"
+				ret=$((ret + 2))
+			fi
 		fi
-	fi
-done
+	done
+
+	ln -sf libminigbm.so.1.0.0 /usr/lib64/libgbm.so.1.0.0
+	ln -sf libminigbm.so.1.0.0 /usr/lib64/libgbm.so.1
+	ln -sf libminigbm.so.1.0.0 /usr/lib64/libgbm.so
+	for LINK in /usr/lib64/libgbm.so /usr/lib64/libgbm.so.1 /usr/lib64/libgbm.so.1.0.0; do
+		chcon -h --reference="$REF_LIB" "$LINK" 2>/dev/null || true
+		if command -v setfattr >/dev/null 2>&1; then
+			setfattr -h -n security.selinux -v "u:object_r:cros_system_file:s0" "$LINK" 2>/dev/null || true
+		fi
+	done
+else
+	ret=$((ret + 1))
+fi
 
 if [ -f "$MINI" ]; then
 	chmod 0755 "$MINI"
@@ -62,18 +78,6 @@ if [ -f "$MINI" ]; then
 		rm -f "${MINI}.tmp"
 		ret=$((ret + 4))
 	fi
-fi
-
-if [ -f "$MINI" ]; then
-	ln -sf libminigbm.so.1.0.0 /usr/lib64/libgbm.so.1.0.0
-	ln -sf libminigbm.so.1.0.0 /usr/lib64/libgbm.so.1
-	ln -sf libminigbm.so.1.0.0 /usr/lib64/libgbm.so
-	for LINK in /usr/lib64/libgbm.so /usr/lib64/libgbm.so.1 /usr/lib64/libgbm.so.1.0.0; do
-		chcon -h --reference="$REF_LIB" "$LINK" 2>/dev/null || true
-		if command -v setfattr >/dev/null 2>&1; then
-			setfattr -h -n security.selinux -v "u:object_r:cros_system_file:s0" "$LINK" 2>/dev/null || true
-		fi
-	done
 fi
 
 CAMERA_CONF="/etc/init/cros-camera.conf"
