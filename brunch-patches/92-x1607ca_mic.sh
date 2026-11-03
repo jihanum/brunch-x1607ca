@@ -12,11 +12,17 @@ for i in $(seq 1 30); do
 done
 
 apply_mic_settings() {
+    # Enable 4-ch DMIC switch and boost DMIC capture volume by ~5 dB (from 40,40 to 48,48)
     amixer -c 0 cset numid=49 on,on,on,on >/dev/null 2>&1 || true
-    amixer -c 0 cset numid=48 40,40 >/dev/null 2>&1 || true
+    amixer -c 0 cset numid=48 48,48 >/dev/null 2>&1 || true
+
+    # Enable ADC capture switch and boost capture volume by ~5 dB (from 50,50 to 57,57)
     amixer -c 0 cset numid=7 on,on >/dev/null 2>&1 || true
-    amixer -c 0 cset numid=6 50,50 >/dev/null 2>&1 || true
+    amixer -c 0 cset numid=6 57,57 >/dev/null 2>&1 || true
+
+    # Select internal mic input and apply +5.00 dB (500 cB) CRAS capture gain
     cras_test_client --select_input 12:0 >/dev/null 2>&1 || true
+    cras_test_client --capture_gain 500 >/dev/null 2>&1 || true
 }
 
 for i in $(seq 1 30); do
@@ -30,6 +36,7 @@ while true; do
     fi
     if ! cras_test_client --dump_server_info 2>/dev/null | grep -E "(12:0|USB|BLUETOOTH).*\*" >/dev/null; then
         cras_test_client --select_input 12:0 >/dev/null 2>&1 || true
+        cras_test_client --capture_gain 500 >/dev/null 2>&1 || true
     fi
     sleep 10
 done
