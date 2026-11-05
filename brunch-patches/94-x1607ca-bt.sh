@@ -1,62 +1,46 @@
-#!/bin/sh
-# ASUS Vivobook 16 (X1607CA) Bluetooth Fix for Floss (btadapterd uhid_hfp panic & config permission denied)
-# Intel AX101
-
 ret=0
 
-mkdir -p /roota/lib/udev/rules.d
-cat << 'UDEV' > /roota/lib/udev/rules.d/99-x1607ca-bluetooth.rules
-KERNEL=="uhid", SUBSYSTEM=="misc", MODE="0666", GROUP="uhid"
-ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="8087", ATTR{idProduct}=="0026", ATTR{power/control}="on", ATTR{power/autosuspend}="0"
-UDEV
+cat > /roota/lib/udev/rules.d/99-x1607ca-uhid.rules << 'EOF'
+KERNEL=="uhid", SUBSYSTEM=="misc", OWNER="bluetooth", GROUP="bluetooth", MODE="0660", RUN+="/bin/chcon u:object_r:uhid_device:s0 /dev/uhid"
+EOF
 if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 0))); fi
 
-mkdir -p /roota/etc/modprobe.d
-cat << 'MODPROBE' > /roota/etc/modprobe.d/btusb-x1607ca.conf
-options btusb enable_autosuspend=0
-MODPROBE
-if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 1))); fi
+cat > /roota/etc/init/x1607ca-bt.conf << 'EOF'
+start on started boot-services
+stop on stopping boot-services
 
-cat << 'UPSTART' > /roota/etc/init/bt-x1607ca-fix.conf
-description "X1607CA Bluetooth UHID and Storage Permission Fix"
-author "brunch-lunar-lake"
-
-start on starting btmanagerd or starting btadapterd
-task
+env BT_USB_AUTOSUSPEND_OFF=1
 
 script
-  # Prevent Kernel 7.1 SELinux policy from denying /dev/uhid and socket operations
-  setenforce 0 2>/dev/null || true
+    if ! grep -qi "X1607CA" /sys/class/dmi/id/bios_version /sys/class/dmi/id/board_name 2>/dev/null; then
+        exit 0
+    fi
 
-  # Ensure /dev/uhid exists and is writable by btadapterd (fixes uhid_hfp.rs:121 panic)
-  modprobe uhid 2>/dev/null || true
-  if [ -e /dev/uhid ]; then
-    chown bluetooth:uhid /dev/uhid 2>/dev/null || true
-    chmod 0666 /dev/uhid 2>/dev/null || true
-  fi
+    # Fix /dev/uhid ownership, permissions (0660 instead of 0666), and SELinux label
+    if [ -e /dev/uhid ]; then
+        chown bluetooth:bluetooth /dev/uhid
+        chmod 0660 /dev/uhid
+        chcon u:object_r:uhid_device:s0 /dev/uhid 2>/dev/null || true
+    fi
 
-  # Ensure /var/lib/bluetooth is writable and fix relative path 'bt_remote_dev_info.conf.new'
-  mkdir -p /var/lib/bluetooth/btstack /var/lib/bluetooth/sysprops.conf.d
-  touch /var/lib/bluetooth/bt_remote_dev_info.conf /var/lib/bluetooth/bt_remote_dev_info.conf.new
-  chown -R bluetooth:bluetooth /var/lib/bluetooth 2>/dev/null || true
-  chmod -R 0775 /var/lib/bluetooth 2>/dev/null || true
+    # Preserve ChromeOS native u:object_r:cros_var_lib_bluetooth:s0 context
+    if [ -d /var/lib/bluetooth ]; then
+        chown -R bluetooth:bluetooth /var/lib/bluetooth
+        find /var/lib/bluetooth -type d -exec chmod 0770 {} +
+        find /var/lib/bluetooth -type f -exec chmod 0660 {} +
+        chcon -R u:object_r:cros_var_lib_bluetooth:s0 /var/lib/bluetooth 2>/dev/null || true
+    fi
 
-  # Disable btusb autosuspend live
-  if [ -e /sys/module/btusb/parameters/enable_autosuspend ]; then
-    echo N > /sys/module/btusb/parameters/enable_autosuspend 2>/dev/null || true
-  fi
+    # Optional: Disable USB autosuspend for Intel Bluetooth (8087:*)
+    if [ "${BT_USB_AUTOSUSPEND_OFF}" = "1" ]; then
+        for dev in /sys/bus/usb/devices/*; do
+            if [ -f "${dev}/idVendor" ] && [ "$(cat "${dev}/idVendor")" = "8087" ]; then
+                [ -w "${dev}/power/control" ] && echo "on" > "${dev}/power/control"
+            fi
+        done
+    fi
 end script
-UPSTART
-if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 2))); fi
-
-if [ -f /roota/etc/init/btadapterd.conf ]; then
-  sed -i 's|-b /dev/uhid\b|-b /dev/uhid,,1|g' /roota/etc/init/btadapterd.conf
-  if ! grep -q "chdir /var/lib/bluetooth" /roota/etc/init/btadapterd.conf; then
-    sed -i '/^expect /i chdir /var/lib/bluetooth' /roota/etc/init/btadapterd.conf
-  fi
-fi
-
-ln -sf /var/lib/bluetooth/bt_remote_dev_info.conf /roota/bt_remote_dev_info.conf
-ln -sf /var/lib/bluetooth/bt_remote_dev_info.conf.new /roota/bt_remote_dev_info.conf.new
+EOF
+if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 1))); fi
 
 exit $ret
