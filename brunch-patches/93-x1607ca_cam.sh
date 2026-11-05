@@ -98,4 +98,48 @@ fi
 exit $ret
 EOF
 
+# Apply calibrated Sonix 3277:0018 V4L2 exposure controls on boot
+cat > /roota/etc/init/x1607ca-cam-exposure.conf << 'EOF'
+start on started cros-camera
+task
+
+script
+    if ! grep -qi "X1607CA" /sys/class/dmi/id/bios_version /sys/class/dmi/id/board_name 2>/dev/null; then
+        exit 0
+    fi
+
+    sleep 2
+    [ -c /dev/video0 ] || exit 0
+
+    python3 - << 'PYEOF'
+import ctypes, fcntl, os
+
+VIDIOC_S_CTRL = 0xc008561c
+
+class v4l2_control(ctypes.Structure):
+    _fields_ = [('id', ctypes.c_uint32), ('value', ctypes.c_int32)]
+
+controls = [
+    (0x009a0901, 3),   # Auto Exposure: 3 (Aperture Priority)
+    (0x009a0903, 1),   # Exposure, Dynamic Framerate: 1
+    (0x0098091c, 2),   # Backlight Compensation: 2
+    (0x00980913, 0),   # Gain: 0
+    (0x00980910, 100), # Gamma: 100
+    (0x00980900, 25),  # Brightness: 25
+]
+
+try:
+    fd = os.open('/dev/video0', os.O_RDWR | os.O_NONBLOCK)
+    for cid, val in controls:
+        try:
+            fcntl.ioctl(fd, VIDIOC_S_CTRL, v4l2_control(id=cid, value=val))
+        except OSError:
+            pass
+    os.close(fd)
+except OSError:
+    pass
+PYEOF
+end script
+EOF
+
 exit $?
