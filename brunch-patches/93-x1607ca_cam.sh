@@ -1,7 +1,5 @@
 #!/bin/sh
 
-# Configure libgbm_m.so (for Lunar Lake / Arrow Lake Mesa) and libminigbm.so.1.0.0
-
 chroot /roota /bin/bash -s <<'EOF'
 set -o pipefail
 ret=0
@@ -98,48 +96,114 @@ fi
 exit $ret
 EOF
 
-# Apply calibrated Sonix 3277:0018 V4L2 exposure controls on boot
 cat > /roota/etc/init/x1607ca-cam-exposure.conf << 'EOF'
 start on started cros-camera
 task
 
 script
-    if ! grep -qi "X1607CA" /sys/class/dmi/id/bios_version /sys/class/dmi/id/board_name 2>/dev/null; then
+    # Only run on ASUS X1607CA
+    if ! grep -qi "X1607CA" \
+        /sys/class/dmi/id/bios_version \
+        /sys/class/dmi/id/board_name 2>/dev/null; then
         exit 0
     fi
 
-    sleep 2
-    [ -c /dev/video0 ] || exit 0
-
     python3 - << 'PYEOF'
-import ctypes, fcntl, os
+import ctypes
+import fcntl
+import os
+import time
+
+DEVICE = "/dev/video0"
+LOG = "/var/log/x1607ca-cam-exposure.log"
 
 VIDIOC_S_CTRL = 0xc008561c
+VIDIOC_G_CTRL = 0xc008561b
 
 class v4l2_control(ctypes.Structure):
-    _fields_ = [('id', ctypes.c_uint32), ('value', ctypes.c_int32)]
+    _fields_ = [
+        ('id', ctypes.c_uint32),
+        ('value', ctypes.c_int32)
+    ]
 
-controls = [
-    (0x009a0901, 3),   # Auto Exposure: 3 (Aperture Priority)
-    (0x009a0903, 1),   # Exposure, Dynamic Framerate: 1
-    (0x0098091c, 2),   # Backlight Compensation: 2
-    (0x00980913, 0),   # Gain: 0
-    (0x00980910, 100), # Gamma: 100
-    (0x00980900, 25),  # Brightness: 25
+def log(message):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(LOG, "a") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except OSError:
+        pass
+
+# Calibrated values verified through live testing.
+SETTINGS = [
+    ("Exposure Auto",          0x009a0901, 1),
+    ("Exposure Absolute",      0x009a0902, 250),
+    ("Exposure Auto Priority", 0x009a0903, 0),
+    ("Brightness",             0x00980900, 25),
+    ("Gamma",                  0x00980910, 100),
+    ("Gain",                   0x00980913, 0),
+    ("Backlight Compensation", 0x0098091c, 2),
 ]
 
-try:
-    fd = os.open('/dev/video0', os.O_RDWR | os.O_NONBLOCK)
-    for cid, val in controls:
+def apply_settings(fd, pass_number):
+    log(f"Starting camera settings pass {pass_number}")
+
+    for name, cid, value in SETTINGS:
         try:
-            fcntl.ioctl(fd, VIDIOC_S_CTRL, v4l2_control(id=cid, value=val))
-        except OSError:
-            pass
+            ctrl = v4l2_control(id=cid, value=value)
+
+            fcntl.ioctl(fd, VIDIOC_S_CTRL, ctrl)
+
+            result = v4l2_control(id=cid, value=0)
+            fcntl.ioctl(fd, VIDIOC_G_CTRL, result)
+
+            log(
+                f"OK: {name}: requested={value}, "
+                f"actual={result.value}"
+            )
+
+        except OSError as e:
+            log(f"FAILED: {name}: {e}")
+
+    log(f"Finished camera settings pass {pass_number}")
+
+# Wait for the camera device to become available.
+fd = None
+
+for attempt in range(30):
+    try:
+        fd = os.open(DEVICE, os.O_RDWR | os.O_NONBLOCK)
+        log("Camera device opened successfully")
+        break
+    except OSError as e:
+        if attempt % 5 == 0:
+            log(f"Waiting for camera: {e}")
+        time.sleep(1)
+
+if fd is None:
+    log("ERROR: Camera device unavailable after 30 attempts")
+    raise SystemExit(1)
+
+try:
+    # Initial application.
+    apply_settings(fd, 1)
+
+    # Reapply to account for camera initialization resets.
+    time.sleep(3)
+    apply_settings(fd, 2)
+
+finally:
     os.close(fd)
-except OSError:
-    pass
+
+log("Camera configuration completed")
 PYEOF
+
 end script
 EOF
+
+chmod 0644 /roota/etc/init/x1607ca-cam-exposure.conf
+
+chcon --reference=/roota/etc/init/cros-camera.conf \
+    /roota/etc/init/x1607ca-cam-exposure.conf 2>/dev/null || true
 
 exit $?
