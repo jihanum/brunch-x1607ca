@@ -9,7 +9,7 @@ cat > /roota/etc/init/x1607ca-bt.conf << 'EOF'
 start on started boot-services
 stop on stopping boot-services
 
-env BT_USB_AUTOSUSPEND_OFF=1
+env BT_USB_AUTOSUSPEND_OFF=0
 
 script
     if ! grep -qi "X1607CA" /sys/class/dmi/id/bios_version /sys/class/dmi/id/board_name 2>/dev/null; then
