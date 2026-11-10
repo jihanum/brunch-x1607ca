@@ -24,7 +24,7 @@ if [ -d /roota/usr/share/power_manager ]; then
 fi
 
 cat > /roota/etc/init/lnl-s2idle.conf << 'EOF'
-description "Arrow Lake s2idle and ACPI wakeup configuration"
+description "Arrow Lake s2idle, Package C10, and ACPI wakeup configuration"
 author "brunch-arl-lnl"
 
 start on starting powerd
@@ -51,6 +51,59 @@ script
     chmod 0755 /var/lib/power_manager
     chmod 0644 /var/lib/power_manager/*
     restorecon -R /var/lib/power_manager 2>/dev/null || true
+
+    (
+        for i in $(seq 1 30); do
+            [ -e /sys/kernel/debug/pmc_core/ltr_ignore ] && break
+            sleep 0.5
+        done
+
+        if [ -w /sys/module/intel_pmc_core/parameters/ltr_ignore_all_suspend ]; then
+            echo N > /sys/module/intel_pmc_core/parameters/ltr_ignore_all_suspend 2>/dev/null || true
+        fi
+
+        for idx in 3 4 6 9 10 11 12 15 17 21 22 24 31 32 34 37 38 39 40; do
+            echo "$idx" > /sys/kernel/debug/pmc_core/ltr_ignore 2>/dev/null || true
+        done
+
+        if [ -w /sys/module/pcie_aspm/parameters/policy ]; then
+            echo powersupersave > /sys/module/pcie_aspm/parameters/policy 2>/dev/null || true
+        fi
+        if [ -w /sys/bus/pci/devices/0000:01:00.0/d3cold_allowed ]; then
+            echo 0 > /sys/bus/pci/devices/0000:01:00.0/d3cold_allowed 2>/dev/null || true
+        fi
+
+        if [ -x /usr/local/bin/python3 ]; then
+            /usr/local/bin/python3 - << 'PYEOF'
+import os, struct
+
+cfg_path = "/sys/bus/pci/devices/0000:00:08.0/config"
+if os.path.exists(cfg_path) and not os.path.exists("/sys/bus/pci/devices/0000:00:08.0/driver"):
+    fd = os.open(cfg_path, os.O_RDWR)
+    cmd = struct.unpack("<H", os.pread(fd, 2, 0x04))[0]
+    if cmd & 0x07:
+        os.pwrite(fd, struct.pack("<H", cmd & ~0x07), 0x04)
+    hdr = os.pread(fd, 64, 0)
+    cap_ptr = hdr[0x34] & 0xFC if (hdr[0x06] & 0x10) else 0
+    while cap_ptr:
+        cap = os.pread(fd, 8, cap_ptr)
+        if cap[0] == 0x01:
+            pmcsr = struct.unpack("<H", cap[4:6])[0]
+            if (pmcsr & 0x03) != 0x03:
+                os.pwrite(fd, struct.pack("<H", (pmcsr & ~0x03) | 0x03), cap_ptr + 4)
+            break
+        cap_ptr = cap[1] & 0xFC
+    os.close(fd)
+PYEOF
+        fi
+
+        for ctrl in /sys/bus/usb/devices/*/power/control \
+                    /sys/bus/pci/devices/*/power/control \
+                    /sys/bus/i2c/devices/*/power/control \
+                    /sys/bus/mei/devices/*/power/control; do
+            [ -w "$ctrl" ] && echo auto > "$ctrl" 2>/dev/null || true
+        done
+    ) &
 end script
 EOF
 if [ "$?" -ne 0 ]; then ret=$((ret + 1)); fi
