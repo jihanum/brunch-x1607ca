@@ -1,19 +1,24 @@
 #!/bin/sh
-# Brunch initramfs patch: /patches/97-x1607ca-power.sh
-# Injects x1607ca-power v3.1 and an SELinux-labeled Upstart service into /roota.
 
 ret=0
 
 mkdir -p /roota/usr/bin /roota/usr/libexec /roota/etc/init || ret=$((ret + 1))
 
-# Clone existing files first with cp -a so security.selinux xattrs are preserved on the inodes
 cp -a /roota/usr/bin/sh /roota/usr/libexec/x1607ca-power.py 2>/dev/null || true
 cp -a /roota/usr/bin/sh /roota/usr/bin/x1607ca-power 2>/dev/null || true
 cp -a /roota/etc/init/ui.conf /roota/etc/init/x1607ca-power.conf 2>/dev/null || true
 
 cat > /roota/usr/libexec/x1607ca-power.py <<'X1607CA_V3_SOURCE'
 #!/usr/local/bin/python3
-"""ASUS X1607CA Brunch power profiles, event-driven v3.1."""
+"""ASUS X1607CA Brunch power profiles
+
+Events:
+- Linux power_supply netlink uevents (AC/battery transitions)
+- ChromeOS powerd SuspendDone D-Bus signal (wake from sleep)
+- Linux inotify on sysfs EPP / platform_profile & selected_mode (catches ChromeOS overwrites)
+- One-shot post-boot and post-event settlement timers (no periodic polling loop)
+"""
+import ctypes
 import fcntl
 import os
 from pathlib import Path
@@ -37,6 +42,13 @@ RESUME_FLAG = Path('/run/x1607ca-power-resume-watcher')
 MODES = {'auto', 'quiet', 'balanced', 'performance'}
 EPP = {'quiet': 'balance_power', 'balanced': 'balance_performance', 'performance': 'performance'}
 
+IN_MODIFY = 0x00000002
+IN_CLOSE_WRITE = 0x00000008
+IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
+IN_NONBLOCK = 0x00000800
+IN_CLOEXEC = 0x00080000
+
 
 def read(path, default=''):
     try:
@@ -52,6 +64,17 @@ def log(message):
 def supported_device():
     return any('X1607CA' in read('/sys/class/dmi/id/' + name).upper()
                for name in ('product_name', 'board_name'))
+
+
+def ensure_state_dir():
+    try:
+        BASE.mkdir(parents=True, exist_ok=True)
+        os.chmod(BASE, 0o700)
+        if not MODE_FILE.exists():
+            MODE_FILE.write_text('auto\n')
+            os.chmod(MODE_FILE, 0o600)
+    except OSError:
+        pass
 
 
 def mode():
@@ -103,7 +126,7 @@ def mismatches():
         differences.append(f'ASUS: {read(PROFILE, "unavailable")} -> {target}')
     for policy in cpu_policies():
         preference = policy / 'energy_performance_preference'
-        choices = (policy / 'energy_performance_available_preferences')
+        choices = policy / 'energy_performance_available_preferences'
         if not preference.exists() or epp not in read(choices).split():
             continue
         current = read(preference)
@@ -112,7 +135,20 @@ def mismatches():
     return differences
 
 
-def apply():
+def drain_fd(fd):
+    if fd is None:
+        return
+    while True:
+        try:
+            if not os.read(fd, 65536):
+                break
+        except BlockingIOError:
+            break
+        except OSError:
+            break
+
+
+def apply(inotify_fd=None):
     target, epp, source, selection = desired()
     if target not in read(CHOICES).split():
         raise RuntimeError(f'Unsupported ASUS profile {target} or choices not ready')
@@ -129,7 +165,7 @@ def apply():
     failures = []
     for policy in cpu_policies():
         preference = policy / 'energy_performance_preference'
-        options = (policy / 'energy_performance_available_preferences')
+        options = policy / 'energy_performance_available_preferences'
         if not preference.exists() or epp not in read(options).split():
             continue
         if read(preference) == epp:
@@ -141,6 +177,7 @@ def apply():
             changed += 1
         except OSError as exc:
             failures.append(f'{policy.name}: {exc}')
+    drain_fd(inotify_fd)
     if failures:
         raise RuntimeError('Unable to apply some CPU EPP values: ' + '; '.join(failures))
     if changed:
@@ -168,7 +205,10 @@ def daemon_pid():
 
 
 def status():
-    print(f'Model: {read("/sys/class/dmi/id/board_name", read("/sys/class/dmi/id/product_name", "unknown"))}')
+    board = read('/sys/class/dmi/id/board_name')
+    product = read('/sys/class/dmi/id/product_name', 'unknown')
+    model_str = f'{product} ({board})' if board and board != product else product
+    print(f'Model: {model_str}')
     print(f'Selected mode: {mode()}')
     print(f'Power source: {power_source()}')
     print(f'ASUS profile: {read(PROFILE, "unavailable")}')
@@ -200,7 +240,7 @@ def status():
 
 
 def set_mode(selection):
-    BASE.mkdir(parents=True, exist_ok=True)
+    ensure_state_dir()
     tmp = MODE_FILE.with_name(f'{MODE_FILE.name}.{os.getpid()}')
     tmp.write_text(selection + '\n')
     os.replace(tmp, MODE_FILE)
@@ -217,6 +257,25 @@ def uevent_is_power_supply(payload):
             and fields.get(b'ACTION') in (b'change', b'add', b'remove'))
 
 
+def setup_inotify():
+    try:
+        libc = ctypes.CDLL('libc.so.6', use_errno=True)
+        ifd = libc.inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
+        if ifd < 0:
+            return None
+        mask = IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE
+        watch_paths = [BASE, PROFILE] + [
+            p / 'energy_performance_preference' for p in cpu_policies()
+        ]
+        for path in watch_paths:
+            if path.exists():
+                libc.inotify_add_watch(ifd, os.fsencode(str(path)), ctypes.c_uint32(mask))
+        return ifd
+    except Exception as exc:
+        log(f'WARNING: inotify setup failed ({exc}); relying on netlink/dbus/timers')
+        return None
+
+
 def stop():
     pid = daemon_pid()
     if not pid:
@@ -227,6 +286,7 @@ def stop():
 
 
 def run_daemon():
+    ensure_state_dir()
     lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -238,11 +298,20 @@ def run_daemon():
     selector = selectors.DefaultSelector()
     dbus_proc = None
     netlink = None
+    inotify_fd = None
     wake_r, wake_w = os.pipe()
     os.set_blocking(wake_w, False)
     selector.register(wake_r, selectors.EVENT_READ, 'signal')
     exit_requested = False
-    deferred_at = None
+    pending_checks = []
+
+    def schedule_checks(delays):
+        nonlocal pending_checks
+        now = time.monotonic()
+        merged = set(pending_checks)
+        for d in delays:
+            merged.add(now + d)
+        pending_checks = sorted(merged)
 
     def request_exit(_sig, _frame):
         nonlocal exit_requested
@@ -256,23 +325,26 @@ def run_daemon():
     signal.signal(signal.SIGINT, request_exit)
 
     def handle_event(origin):
-        nonlocal deferred_at
         try:
             changes = mismatches()
             if changes:
                 log(f'{origin}: {len(changes)} mismatch(es); applying')
-                apply()
+                apply(inotify_fd)
             else:
                 log(f'{origin}: policy already matches target')
         except (OSError, RuntimeError) as exc:
             log(f'WARNING {origin}: {exc}')
-        deferred_at = time.monotonic() + 3.0
+        schedule_checks((1.0, 3.0, 8.0))
 
     try:
         netlink = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, 15)
         netlink.setblocking(False)
         netlink.bind((os.getpid(), 1))
         selector.register(netlink, selectors.EVENT_READ, 'uevent')
+
+        inotify_fd = setup_inotify()
+        if inotify_fd is not None:
+            selector.register(inotify_fd, selectors.EVENT_READ, 'inotify')
 
         tool = shutil.which('dbus-monitor')
         if tool:
@@ -286,29 +358,35 @@ def run_daemon():
             log('WARNING: dbus-monitor unavailable; automatic reapply on resume is not guaranteed')
 
         PID_FILE.write_text(str(os.getpid()) + '\n')
-        log('Started event-driven monitor (kernel power_supply uevents, powerd resume if available)')
+        log('Started event-driven monitor v3.3 (netlink + dbus + sysfs inotify)')
         try:
-            apply()
+            apply(inotify_fd)
         except (OSError, RuntimeError) as exc:
             log(f'WARNING initial apply: {exc}')
 
+        schedule_checks((2.0, 5.0, 10.0, 20.0, 35.0, 60.0))
+
         dbus_buffer = b''
         while not exit_requested:
-            timeout = None if deferred_at is None else max(0, deferred_at - time.monotonic())
+            timeout = None if not pending_checks else max(0, pending_checks[0] - time.monotonic())
             events = selector.select(timeout)
-            if deferred_at is not None and time.monotonic() >= deferred_at:
-                deferred_at = None
+            now = time.monotonic()
+            if pending_checks and now >= pending_checks[0]:
+                while pending_checks and pending_checks[0] <= now:
+                    pending_checks.pop(0)
                 try:
                     if mismatches():
-                        log('Post-event verification found drift; reapplying once')
-                        apply()
+                        log('Verification check found drift; reapplying')
+                        apply(inotify_fd)
                 except (OSError, RuntimeError) as exc:
-                    log(f'WARNING post-event verification: {exc}')
+                    log(f'WARNING verification check: {exc}')
             for key, _ in events:
                 if key.data == 'signal':
-                    os.read(wake_r, 4096)
-                    continue
-                if key.data == 'uevent':
+                    drain_fd(wake_r)
+                elif key.data == 'inotify':
+                    drain_fd(inotify_fd)
+                    schedule_checks((0.25, 2.0))
+                elif key.data == 'uevent':
                     try:
                         payload = netlink.recv(65536)
                     except BlockingIOError:
@@ -342,6 +420,8 @@ def run_daemon():
                 dbus_proc.stdout.close()
         if netlink is not None:
             netlink.close()
+        if inotify_fd is not None:
+            os.close(inotify_fd)
         selector.close()
         os.close(wake_r)
         os.close(wake_w)
@@ -390,7 +470,8 @@ cat > /roota/usr/bin/x1607ca-power <<'EOF'
 #!/bin/sh
 export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 export LD_LIBRARY_PATH="/usr/local/lib64:/usr/local/lib"
-exec /usr/local/bin/python3 /usr/libexec/x1607ca-power.py "$@"
+PYTHON_BIN="$(command -v python3 2>/dev/null || echo /usr/local/bin/python3)"
+exec "$PYTHON_BIN" /usr/libexec/x1607ca-power.py "$@"
 EOF
 [ $? -eq 0 ] || ret=$((ret + 1))
 
@@ -411,7 +492,6 @@ script
     export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
     export LD_LIBRARY_PATH="/usr/local/lib64:/usr/local/lib"
 
-    # Wait up to 30s for /usr/local (dev_image) and D-Bus to become ready
     for i in $(seq 1 60); do
         if [ -x /usr/local/bin/python3 ] && [ -S /run/dbus/system_bus_socket ]; then
             break
