@@ -109,7 +109,7 @@ def desired():
     source = power_source()
     target = current_mode
     if current_mode == 'auto':
-        target = {'battery': 'quiet', 'ac': 'balanced'}.get(source)
+        target = {'battery': 'quiet', 'ac': 'performance'}.get(source)
         if target is None:
             raise RuntimeError('Cannot determine AC/battery power source')
     return target, EPP[target], source, current_mode
