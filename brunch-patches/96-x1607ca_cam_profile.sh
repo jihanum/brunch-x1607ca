@@ -1,6 +1,4 @@
 #!/bin/sh
-# Persistent V4L2 camera control patch for ASUS Vivobook 16 (Sonix UVC 3277:0018)
-# Runs in Brunch initramfs (/roota) or live on a booted system (/).
 
 ret=0
 
@@ -40,23 +38,17 @@ CTRL_CONF="${ROOT}/etc/camera-controls.conf"
 UPSTART_CONF="${ROOT}/etc/init/cros-camera-ctrl.conf"
 UDEV_RULE="${ROOT}/lib/udev/rules.d/99-cros-camera-ctrl.rules"
 
-# Ensure no global ld.so.conf.d override exists that could conflict with ChromeOS UI libraries
 rm -f "${ROOT}/etc/ld.so.conf.d/99-usr-local-python.conf" 2>/dev/null || true
 
-# 1. Write default camera controls configuration
+rm -f "/run/cros-camera-ctrl.override.conf" \
+      "/mnt/stateful_partition/etc/camera-controls.conf" \
+      "${ROOT}/mnt/stateful_partition/etc/camera-controls.conf" 2>/dev/null || true
+
 cp -a "$REF_CONF" "$CTRL_CONF" 2>/dev/null || true
 cat <<'CONFEOF' > "$CTRL_CONF"
-# Target USB ID (ASUS FHD Webcam - Sonix UVC)
+
 USB_VENDOR=3277
 USB_PRODUCT=0018
-
-# Mode switches are applied before value controls so manual settings are not locked.
-# Common controls on Sonix 3277:0018 (uncomment or adjust as needed):
-#   power_line_frequency: 0 = Disabled, 1 = 50Hz, 2 = 60Hz
-#   auto_exposure: 1 = Manual Mode, 3 = Aperture Priority Mode (Auto)
-#   exposure_dynamic_framerate: 0 = Off, 1 = On
-#   white_balance_automatic: 0 = Manual, 1 = Auto
-#   You can specify exact integers or percentages of the hardware range (e.g. 55%).
 
 power_line_frequency=2
 backlight_compensation=2
@@ -69,16 +61,20 @@ gain=0
 exposure_dynamic_framerate=1
 white_balance_automatic=1
 
-# To test changes live:
+# To test changes live (session-only, resets on reboot):
 # sudo cros-camera-ctrl --list
 # sudo cros-camera-ctrl --set brightness=40 contrast=42 saturation=80
+#
+# To save live overrides across reboots (auto-cleared if this file is later edited):
+# sudo cros-camera-ctrl --set --save brightness=40
+#
+# To clear all live/saved overrides and revert to this file:
 # sudo cros-camera-ctrl --reset
 CONFEOF
 if [ "$?" -ne 0 ]; then ret=$((ret + 1)); fi
 chmod 0644 "$CTRL_CONF"
 restore_selinux_file "$REF_CONF" "$CTRL_CONF" "u:object_r:cros_system_file:s0"
 
-# 2. Write the hybrid sh/Python V4L2 ioctl + inotify daemon/CLI tool
 cp -a "$REF_BIN" "$CTRL_BIN" 2>/dev/null || true
 cat <<'PYEOF' > "$CTRL_BIN"
 #!/bin/sh
@@ -97,8 +93,8 @@ import ctypes
 import select
 import signal
 import errno
+import hashlib
 
-# Linux x86_64 V4L2 ioctl constants (include/uapi/linux/videodev2.h)
 VIDIOC_QUERYCTRL = 0xC0445624  # _IOWR('V', 36, struct v4l2_queryctrl) [68 bytes]
 VIDIOC_G_CTRL    = 0xC008561B  # _IOWR('V', 27, struct v4l2_control)   [8 bytes]
 VIDIOC_S_CTRL    = 0xC008561C  # _IOWR('V', 28, struct v4l2_control)   [8 bytes]
@@ -170,9 +166,9 @@ IMAGE_CTRL_KEYS = {
 
 DEFAULT_CONF = "/etc/camera-controls.conf"
 STATEFUL_CONF = "/mnt/stateful_partition/etc/camera-controls.conf"
+RUNTIME_CONF = "/run/cros-camera-ctrl.override.conf"
 LOCK_FILE = "/run/cros-camera-ctrl.lock"
 
-# inotify constants
 IN_MODIFY        = 0x00000002
 IN_CLOSE_WRITE   = 0x00000008
 IN_CLOSE_NOWRITE = 0x00000010
@@ -200,12 +196,21 @@ def normalize_name(raw_name):
     return "".join(out).strip("_")
 
 
+def get_file_sha256(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        return ""
+
+
 def parse_conf_file(path):
     vendor = None
     product = None
+    base_hash = None
     controls = {}
     if not os.path.isfile(path):
-        return vendor, product, controls
+        return vendor, product, base_hash, controls
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
@@ -219,50 +224,75 @@ def parse_conf_file(path):
                     vendor = v.lower()
                 elif k == "USB_PRODUCT":
                     product = v.lower()
+                elif k == "BASE_CONF_HASH":
+                    base_hash = v.lower()
                 else:
                     controls[normalize_name(k)] = v
     except Exception:
         pass
-    return vendor, product, controls
+    return vendor, product, base_hash, controls
+
+
+def merge_control_dict(dst, src):
+    for k, val in src.items():
+        canon = CANONICAL_ALIASES.get(k, k)
+        for alias_k, alias_canon in CANONICAL_ALIASES.items():
+            if alias_canon == canon and alias_k in dst and alias_k != k:
+                del dst[alias_k]
+        if canon in dst and canon != k:
+            del dst[canon]
+        dst[k] = val
 
 
 def load_config():
     vendor = "3277"
     product = "0018"
     controls = {}
-    for path in (DEFAULT_CONF, STATEFUL_CONF):
-        v, p, ctrls = parse_conf_file(path)
-        if v:
-            vendor = v
-        if p:
-            product = p
-        for k, val in ctrls.items():
-            canon = CANONICAL_ALIASES.get(k, k)
-            for alias_k, alias_canon in CANONICAL_ALIASES.items():
-                if alias_canon == canon and alias_k in controls and alias_k != k:
-                    del controls[alias_k]
-            if canon in controls and canon != k:
-                del controls[canon]
-            controls[k] = val
+    default_hash = get_file_sha256(DEFAULT_CONF)
+
+    v, p, _, def_ctrls = parse_conf_file(DEFAULT_CONF)
+    if v:
+        vendor = v
+    if p:
+        product = p
+    merge_control_dict(controls, def_ctrls)
+
+    for over_path in (STATEFUL_CONF, RUNTIME_CONF):
+        if not os.path.isfile(over_path):
+            continue
+        ov, op, base_hash, over_ctrls = parse_conf_file(over_path)
+        if default_hash and base_hash != default_hash:
+            try:
+                os.remove(over_path)
+            except OSError:
+                pass
+            continue
+        if ov:
+            vendor = ov
+        if op:
+            product = op
+        merge_control_dict(controls, over_ctrls)
+
     return vendor, product, controls
 
 
-def save_stateful_overrides(new_overrides):
-    stateful_dir = os.path.dirname(STATEFUL_CONF)
-    os.makedirs(stateful_dir, exist_ok=True)
-    v, p, existing = parse_conf_file(STATEFUL_CONF)
-    for k, val in new_overrides.items():
-        canon = CANONICAL_ALIASES.get(k, k)
-        for alias_k, alias_canon in CANONICAL_ALIASES.items():
-            if alias_canon == canon and alias_k in existing and alias_k != k:
-                del existing[alias_k]
-        if canon in existing and canon != k:
-            del existing[canon]
-        existing[k] = val
+def save_overrides(new_overrides, target_path):
+    target_dir = os.path.dirname(target_path)
+    os.makedirs(target_dir, exist_ok=True)
+    default_hash = get_file_sha256(DEFAULT_CONF)
 
-    tmp_path = f"{STATEFUL_CONF}.tmp.{os.getpid()}"
+    v, p, base_hash, existing = parse_conf_file(target_path)
+    if default_hash and base_hash != default_hash:
+        existing = {}
+        v, p = None, None
+
+    merge_control_dict(existing, new_overrides)
+
+    tmp_path = f"{target_path}.tmp.{os.getpid()}"
     with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write("# Live camera control overrides (managed by cros-camera-ctrl)\n")
+        f.write("# Camera control overrides (managed by cros-camera-ctrl)\n")
+        if default_hash:
+            f.write(f"BASE_CONF_HASH={default_hash}\n")
         if v:
             f.write(f"USB_VENDOR={v}\n")
         if p:
@@ -270,7 +300,7 @@ def save_stateful_overrides(new_overrides):
         for k, val in existing.items():
             f.write(f"{k}={val}\n")
     os.chmod(tmp_path, 0o644)
-    os.replace(tmp_path, STATEFUL_CONF)
+    os.replace(tmp_path, target_path)
 
 
 def notify_daemon():
@@ -380,7 +410,6 @@ def find_camera_nodes(target_vendor, target_product):
         if target_vendor and target_product:
             if v != target_vendor.lower() or p != target_product.lower():
                 continue
-        # Only select nodes that expose actual image controls (skips auxiliary /dev/video2 node)
         try:
             fd = os.open(dev_path, os.O_RDWR | os.O_NONBLOCK)
             try:
@@ -438,7 +467,6 @@ def apply_controls_to_node(dev_path, controls_cfg, only_if_changed=False, verbos
             if meta is None and key in STANDARD_CIDS:
                 meta = cid_to_meta.get(STANDARD_CIDS[key])
 
-            # Never force an ioctl onto a node that does not advertise the control
             if meta is None:
                 if verbose:
                     print(
@@ -530,7 +558,10 @@ def drain_self_events(inotify_fd, dev_watch_wds):
             offset += IN_EVENT_STRUCT.size + name_len
             name = name_bytes.split(b"\x00", 1)[0].decode("utf-8", errors="ignore")
             if wd not in dev_watch_wds:
-                if name.startswith("video") or name == "camera-controls.conf":
+                if name.startswith("video") or name in (
+                    "camera-controls.conf",
+                    "cros-camera-ctrl.override.conf",
+                ):
                     need_rescan = True
             elif mask & IN_DELETE_SELF:
                 need_rescan = True
@@ -560,12 +591,15 @@ def run_daemon():
     if inotify_fd < 0:
         return 1
 
-    conf_watch_mask = IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO | IN_MODIFY
+    conf_watch_mask = IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO | IN_MODIFY | IN_DELETE
     dev_dir_wd = libc.inotify_add_watch(
         inotify_fd, b"/dev", IN_CREATE | IN_DELETE
     )
     etc_dir_wd = libc.inotify_add_watch(
         inotify_fd, b"/etc", conf_watch_mask
+    )
+    run_dir_wd = libc.inotify_add_watch(
+        inotify_fd, b"/run", conf_watch_mask
     )
     stateful_etc = "/mnt/stateful_partition/etc"
     os.makedirs(stateful_etc, exist_ok=True)
@@ -691,7 +725,10 @@ def run_daemon():
 
                 if wd == dev_dir_wd and name.startswith("video"):
                     need_rescan = True
-                elif wd in (etc_dir_wd, stateful_wd) and name == "camera-controls.conf":
+                elif wd in (etc_dir_wd, stateful_wd, run_dir_wd) and name in (
+                    "camera-controls.conf",
+                    "cros-camera-ctrl.override.conf",
+                ):
                     need_rescan = True
                 elif wd in watched_nodes:
                     if mask & IN_DELETE_SELF:
@@ -722,13 +759,14 @@ def main():
         return list_camera_controls()
 
     if "--reset" in args:
-        if os.path.exists(STATEFUL_CONF):
-            try:
-                os.remove(STATEFUL_CONF)
-                print(f"Removed live overrides in {STATEFUL_CONF}; reverting to {DEFAULT_CONF}.")
-            except OSError as e:
-                print(f"Failed to remove {STATEFUL_CONF}: {e}", file=sys.stderr)
-                return 1
+        for path in (RUNTIME_CONF, STATEFUL_CONF):
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                    print(f"Removed overrides in {path}.")
+                except OSError as e:
+                    print(f"Failed to remove {path}: {e}", file=sys.stderr)
+                    return 1
         vendor, product, cfg = load_config()
         for dev_path in find_camera_nodes(vendor, product):
             apply_controls_to_node(dev_path, cfg, only_if_changed=False, verbose=True)
@@ -737,21 +775,23 @@ def main():
 
     if "--set" in args:
         idx = args.index("--set")
+        persist_save = "--save" in args
         overrides = {}
         for item in args[idx + 1 :]:
+            if item == "--save":
+                continue
             if "=" in item:
                 k, v = item.split("=", 1)
                 overrides[normalize_name(k)] = v.strip()
         if not overrides:
-            print("Usage: cros-camera-ctrl --set key1=val1 [key2=val2 ...]", file=sys.stderr)
+            print("Usage: cros-camera-ctrl --set [--save] key1=val1 [key2=val2 ...]", file=sys.stderr)
             return 1
         vendor, product, _ = load_config()
         nodes = find_camera_nodes(vendor, product)
-        # Apply overrides once directly to hardware so old -> new values are accurate
         for dev_path in nodes:
             apply_controls_to_node(dev_path, overrides, only_if_changed=False, verbose=True)
-        # Persist overrides and notify daemon so it locks in the new values
-        save_stateful_overrides(overrides)
+        target_conf = STATEFUL_CONF if persist_save else RUNTIME_CONF
+        save_overrides(overrides, target_conf)
         notify_daemon()
         return 0
 
@@ -765,7 +805,7 @@ def main():
     if "--daemon" in args:
         return run_daemon()
 
-    print("Usage: cros-camera-ctrl [--apply | --list | --set key=val ... | --reset | --daemon | --udev]")
+    print("Usage: cros-camera-ctrl [--apply | --list | --set [--save] key=val ... | --reset | --daemon | --udev]")
     return 0
 
 
@@ -776,7 +816,6 @@ if [ "$?" -ne 0 ]; then ret=$((ret + 2)); fi
 chmod 0755 "$CTRL_BIN"
 restore_selinux_file "$REF_BIN" "$CTRL_BIN" "u:object_r:cros_system_file:s0"
 
-# 3. Write Upstart service (/etc/init/cros-camera-ctrl.conf)
 cp -a "$REF_INIT" "$UPSTART_CONF" 2>/dev/null || true
 cat <<'INITEOF' > "$UPSTART_CONF"
 description "Persistent V4L2 camera property daemon for Brunch ChromeOS"
@@ -808,7 +847,6 @@ if [ "$?" -ne 0 ]; then ret=$((ret + 4)); fi
 chmod 0644 "$UPSTART_CONF"
 restore_selinux_file "$REF_INIT" "$UPSTART_CONF" "u:object_r:cros_init_conf_file:s0"
 
-# 4. Write udev rule for hotplug and USB reset-resume across sleep cycles
 cp -a "$REF_UDEV" "$UDEV_RULE" 2>/dev/null || true
 cat <<'UDEVEOF' > "$UDEV_RULE"
 ACTION=="add|change|bind", SUBSYSTEM=="video4linux", ATTRS{idVendor}=="3277", ATTRS{idProduct}=="0018", RUN+="/usr/bin/cros-camera-ctrl --udev"
