@@ -60,9 +60,9 @@ USB_PRODUCT=0018
 
 power_line_frequency=2
 backlight_compensation=2
-brightness=25
-contrast=35
-gamma=75
+brightness=48
+contrast=42
+gamma=90
 saturation=72
 sharpness=5
 gain=0
