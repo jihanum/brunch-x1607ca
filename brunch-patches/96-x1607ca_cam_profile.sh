@@ -21,8 +21,8 @@ restore_selinux_file() {
     fi
 }
 
-REF_BIN="${ROOT}/usr/bin/awk"
-[ ! -f "$REF_BIN" ] && REF_BIN="${ROOT}/bin/sh"
+REF_BIN="${ROOT}/usr/bin/mawk"
+[ ! -f "$REF_BIN" ] && REF_BIN="${ROOT}/bin/bash"
 
 REF_INIT="${ROOT}/etc/init/cras.conf"
 [ ! -f "$REF_INIT" ] && REF_INIT="${ROOT}/etc/init/ui.conf"
@@ -30,23 +30,20 @@ REF_INIT="${ROOT}/etc/init/cras.conf"
 REF_CONF="${ROOT}/etc/hosts"
 [ ! -f "$REF_CONF" ] && REF_CONF="$REF_INIT"
 
-REF_UDEV="${ROOT}/lib/udev/rules.d/50-udev-default.rules"
-[ ! -f "$REF_UDEV" ] && REF_UDEV="$REF_CONF"
-
 CTRL_BIN="${ROOT}/usr/bin/cros-camera-ctrl"
 CTRL_CONF="${ROOT}/etc/camera-controls.conf"
 UPSTART_CONF="${ROOT}/etc/init/cros-camera-ctrl.conf"
 UDEV_RULE="${ROOT}/lib/udev/rules.d/99-cros-camera-ctrl.rules"
 
-rm -f "${ROOT}/etc/ld.so.conf.d/99-usr-local-python.conf" 2>/dev/null || true
+rm -f "$UDEV_RULE" "${ROOT}/etc/ld.so.conf.d/99-usr-local-python.conf" 2>/dev/null || true
 
 rm -f "/run/cros-camera-ctrl.override.conf" \
       "/mnt/stateful_partition/etc/camera-controls.conf" \
       "${ROOT}/mnt/stateful_partition/etc/camera-controls.conf" 2>/dev/null || true
 
+rm -f "$CTRL_CONF" 2>/dev/null || true
 cp -a "$REF_CONF" "$CTRL_CONF" 2>/dev/null || true
 cat <<'CONFEOF' > "$CTRL_CONF"
-
 USB_VENDOR=3277
 USB_PRODUCT=0018
 
@@ -61,21 +58,24 @@ gain=0
 exposure_dynamic_framerate=1
 white_balance_automatic=1
 
-# To test changes live (session-only, resets on reboot):
+# To test changes live:
 # sudo cros-camera-ctrl --list
-# sudo cros-camera-ctrl --set brightness=40 contrast=42 saturation=80
+# sudo cros-camera-ctrl --set [argument1]=[value] [argument2]=[value] ...
 #
-# To save live overrides across reboots (auto-cleared if this file is later edited):
+# To save live overrides:
 # sudo cros-camera-ctrl --set --save brightness=40
 #
-# To clear all live/saved overrides and revert to this file:
+# To revert to values saved in this file:
 # sudo cros-camera-ctrl --reset
 CONFEOF
 if [ "$?" -ne 0 ]; then ret=$((ret + 1)); fi
 chmod 0644 "$CTRL_CONF"
 restore_selinux_file "$REF_CONF" "$CTRL_CONF" "u:object_r:cros_system_file:s0"
 
-cp -a "$REF_BIN" "$CTRL_BIN" 2>/dev/null || true
+rm -f "$CTRL_BIN" 2>/dev/null || true
+if [ -f "$REF_BIN" ] && [ ! -L "$REF_BIN" ]; then
+    cp -a "$REF_BIN" "$CTRL_BIN" 2>/dev/null || true
+fi
 cat <<'PYEOF' > "$CTRL_BIN"
 #!/bin/sh
 """:"
@@ -335,6 +335,18 @@ def find_usb_parent(sys_video_dir):
     return None, "", ""
 
 
+def enable_usb_autosuspend(usb_dir):
+    if not usb_dir:
+        return
+    for attr, val in (("power/autosuspend_delay_ms", "2000\n"), ("power/control", "auto\n")):
+        p = os.path.join(usb_dir, attr)
+        try:
+            with open(p, "w", encoding="ascii") as f:
+                f.write(val)
+        except OSError:
+            pass
+
+
 def query_all_controls(fd):
     """Enumerate all V4L2 controls supported by the open device fd."""
     ctrls = {}
@@ -406,20 +418,14 @@ def find_camera_nodes(target_vendor, target_product):
         dev_path = f"/dev/{dev_name}"
         if not os.path.exists(dev_path):
             continue
-        _, v, p = find_usb_parent(sys_dir)
+        usb_dir, v, p = find_usb_parent(sys_dir)
         if target_vendor and target_product:
             if v != target_vendor.lower() or p != target_product.lower():
                 continue
-        try:
-            fd = os.open(dev_path, os.O_RDWR | os.O_NONBLOCK)
-            try:
-                ctrls = query_all_controls(fd)
-                if ctrls and (set(ctrls.keys()) & IMAGE_CTRL_KEYS):
-                    nodes.append(dev_path)
-            finally:
-                os.close(fd)
-        except OSError:
-            continue
+        enable_usb_autosuspend(usb_dir)
+        idx_str = read_sysfs(os.path.join(sys_dir, "index"))
+        if idx_str in ("", "0"):
+            nodes.append(dev_path)
     return nodes
 
 
@@ -445,7 +451,7 @@ def apply_controls_to_node(dev_path, controls_cfg, only_if_changed=False, verbos
         return False
     changed = False
     try:
-        fd = os.open(dev_path, os.O_RDWR | os.O_NONBLOCK)
+        fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError as e:
         if verbose:
             print(f"[{dev_path}] Failed to open device: {e}", file=sys.stderr)
@@ -515,7 +521,7 @@ def list_camera_controls():
 
     for dev_path in nodes:
         print(f"=== {dev_path} (USB {vendor}:{product}) ===")
-        fd = os.open(dev_path, os.O_RDWR | os.O_NONBLOCK)
+        fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
         try:
             ctrls = query_all_controls(fd)
             for norm, m in sorted(ctrls.items(), key=lambda x: x[1]["id"]):
@@ -627,7 +633,8 @@ def run_daemon():
 
         nodes = find_camera_nodes(vendor, product)
         for dev_path in nodes:
-            apply_controls_to_node(dev_path, controls_cfg, only_if_changed=False)
+            if is_held_by_other_process(dev_path):
+                apply_controls_to_node(dev_path, controls_cfg, only_if_changed=True)
             wd = libc.inotify_add_watch(
                 inotify_fd,
                 dev_path.encode("utf-8"),
@@ -643,23 +650,11 @@ def run_daemon():
     poller = select.poll()
     poller.register(inotify_fd, select.POLLIN)
 
-    BURST_DELAYS = (0.05, 0.20, 0.50, 1.20, 2.00)
+    BURST_DELAYS = (0.20, 0.60, 1.20)
     pending_bursts = []
-    last_sleep_gap = time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(
-        time.CLOCK_MONOTONIC
-    )
 
     while True:
         now = time.monotonic()
-
-        cur_gap = time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(
-            time.CLOCK_MONOTONIC
-        )
-        if cur_gap - last_sleep_gap > 1.5:
-            last_sleep_gap = cur_gap
-            time.sleep(0.4)
-            refresh_watches_and_apply()
-            now = time.monotonic()
 
         if reload_requested[0]:
             reload_requested[0] = False
@@ -670,19 +665,14 @@ def run_daemon():
         if pending_bursts and now >= pending_bursts[0]:
             pending_bursts.pop(0)
             for dev_path in set(watched_nodes.values()):
-                apply_controls_to_node(dev_path, controls_cfg, only_if_changed=False)
+                if is_held_by_other_process(dev_path):
+                    apply_controls_to_node(dev_path, controls_cfg, only_if_changed=True)
             if drain_self_events(inotify_fd, set(watched_nodes.keys())):
                 reload_requested[0] = True
             continue
 
-        external_active = any(
-            is_held_by_other_process(p) for p in set(watched_nodes.values())
-        )
-
         if pending_bursts:
             timeout_ms = max(10, int((pending_bursts[0] - now) * 1000))
-        elif external_active:
-            timeout_ms = 2000
         else:
             timeout_ms = None
 
@@ -692,11 +682,6 @@ def run_daemon():
             continue
 
         if not events:
-            if external_active and not pending_bursts:
-                for dev_path in set(watched_nodes.values()):
-                    apply_controls_to_node(dev_path, controls_cfg, only_if_changed=True)
-                if drain_self_events(inotify_fd, set(watched_nodes.keys())):
-                    reload_requested[0] = True
             continue
 
         need_rescan = False
@@ -796,10 +781,6 @@ def main():
         return 0
 
     if "--udev" in args:
-        vendor, product, cfg = load_config()
-        for dev_path in find_camera_nodes(vendor, product):
-            apply_controls_to_node(dev_path, cfg, only_if_changed=False)
-        notify_daemon()
         return 0
 
     if "--daemon" in args:
@@ -816,6 +797,7 @@ if [ "$?" -ne 0 ]; then ret=$((ret + 2)); fi
 chmod 0755 "$CTRL_BIN"
 restore_selinux_file "$REF_BIN" "$CTRL_BIN" "u:object_r:cros_system_file:s0"
 
+rm -f "$UPSTART_CONF" 2>/dev/null || true
 cp -a "$REF_INIT" "$UPSTART_CONF" 2>/dev/null || true
 cat <<'INITEOF' > "$UPSTART_CONF"
 description "Persistent V4L2 camera property daemon for Brunch ChromeOS"
@@ -845,15 +827,7 @@ exec /usr/local/bin/python3 /usr/bin/cros-camera-ctrl --daemon
 INITEOF
 if [ "$?" -ne 0 ]; then ret=$((ret + 4)); fi
 chmod 0644 "$UPSTART_CONF"
-restore_selinux_file "$REF_INIT" "$UPSTART_CONF" "u:object_r:cros_init_conf_file:s0"
-
-cp -a "$REF_UDEV" "$UDEV_RULE" 2>/dev/null || true
-cat <<'UDEVEOF' > "$UDEV_RULE"
-ACTION=="add|change|bind", SUBSYSTEM=="video4linux", ATTRS{idVendor}=="3277", ATTRS{idProduct}=="0018", RUN+="/usr/bin/cros-camera-ctrl --udev"
-UDEVEOF
-if [ "$?" -ne 0 ]; then ret=$((ret + 8)); fi
-chmod 0644 "$UDEV_RULE"
-restore_selinux_file "$REF_UDEV" "$UDEV_RULE" "u:object_r:cros_udev_rules_file:s0"
+restore_selinux_file "$REF_INIT" "$UPSTART_CONF" "u:object_r:cros_conf_file:s0"
 
 if [ "$LIVE" -eq 1 ]; then
     udevadm control --reload-rules 2>/dev/null || true
