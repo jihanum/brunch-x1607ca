@@ -1,29 +1,38 @@
 #!/bin/sh
 ret=0
 
-rm -f /roota/usr/sbin/x1607ca-bt-sco-daemon.py 2>/dev/null || true
+if [ -d /roota/etc ]; then
+    ROOT="/roota"
+    LIVE=0
+else
+    ROOT=""
+    LIVE=1
+fi
 
-cat > /roota/lib/udev/rules.d/99-x1607ca-uhid.rules << 'EOF'
+rm -f "${ROOT}/usr/sbin/x1607ca-bt-sco-daemon.py" 2>/dev/null || true
+
+cat > "${ROOT}/lib/udev/rules.d/99-x1607ca-uhid.rules" << 'EOF'
 KERNEL=="uhid", SUBSYSTEM=="misc", OWNER="bluetooth", GROUP="bluetooth", MODE="0660", RUN+="/bin/chcon u:object_r:uhid_device:s0 /dev/uhid"
-ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="8087", ATTR{idProduct}=="0026", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="8087", ATTR{idProduct}=="0026", TEST=="power/autosuspend_delay_ms", ATTR{power/autosuspend_delay_ms}="2000"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="8087", ATTR{idProduct}=="0026", TEST=="power/control", ATTR{power/control}="auto"
 EOF
 if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 0))); fi
-chmod 0644 /roota/lib/udev/rules.d/99-x1607ca-uhid.rules 2>/dev/null || true
-chcon u:object_r:cros_udev_rules_file:s0 /roota/lib/udev/rules.d/99-x1607ca-uhid.rules 2>/dev/null || true
+chmod 0644 "${ROOT}/lib/udev/rules.d/99-x1607ca-uhid.rules" 2>/dev/null || true
+chcon u:object_r:cros_udev_rules_file:s0 "${ROOT}/lib/udev/rules.d/99-x1607ca-uhid.rules" 2>/dev/null || true
 
-mkdir -p /roota/etc/modprobe.d
-cat > /roota/etc/modprobe.d/99-x1607ca-btusb.conf << 'EOF'
-options btusb enable_autosuspend=0
+mkdir -p "${ROOT}/etc/modprobe.d"
+cat > "${ROOT}/etc/modprobe.d/99-x1607ca-btusb.conf" << 'EOF'
+options btusb enable_autosuspend=1
 EOF
-chmod 0644 /roota/etc/modprobe.d/99-x1607ca-btusb.conf 2>/dev/null || true
-chcon u:object_r:cros_conf_file:s0 /roota/etc/modprobe.d/99-x1607ca-btusb.conf 2>/dev/null || true
+chmod 0644 "${ROOT}/etc/modprobe.d/99-x1607ca-btusb.conf" 2>/dev/null || true
+chcon u:object_r:cros_conf_file:s0 "${ROOT}/etc/modprobe.d/99-x1607ca-btusb.conf" 2>/dev/null || true
 
-cat > /roota/etc/init/x1607ca-bt.conf << 'EOF'
+cat > "${ROOT}/etc/init/x1607ca-bt.conf" << 'EOF'
 start on started boot-services
 stop on stopping boot-services
 respawn
 
-env BT_USB_AUTOSUSPEND_OFF=1
+env BT_USB_AUTOSUSPEND_OFF=0
 
 script
     set +e
@@ -51,15 +60,20 @@ script
         chcon -R u:object_r:cros_var_lib_bluetooth:s0 /var/lib/bluetooth 2>/dev/null || true
     fi
 
-    if [ "${BT_USB_AUTOSUSPEND_OFF}" = "1" ]; then
-        for dev in /sys/bus/usb/devices/*; do
-            if [ -f "${dev}/idVendor" ] && [ "$(cat "${dev}/idVendor" 2>/dev/null)" = "8087" ]; then
-                if [ -w "${dev}/power/control" ]; then
-                    echo "on" > "${dev}/power/control"
+    for dev in /sys/bus/usb/devices/*; do
+        if [ -f "${dev}/idVendor" ] && [ "$(cat "${dev}/idVendor" 2>/dev/null)" = "8087" ]; then
+            if [ -w "${dev}/power/autosuspend_delay_ms" ]; then
+                echo "2000" > "${dev}/power/autosuspend_delay_ms" 2>/dev/null || true
+            fi
+            if [ -w "${dev}/power/control" ]; then
+                if [ "${BT_USB_AUTOSUSPEND_OFF}" = "1" ]; then
+                    echo "on" > "${dev}/power/control" 2>/dev/null || true
+                else
+                    echo "auto" > "${dev}/power/control" 2>/dev/null || true
                 fi
             fi
-        done
-    fi
+        fi
+    done
 
     export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     export LD_LIBRARY_PATH="/usr/local/lib64:/usr/local/lib"
@@ -104,6 +118,40 @@ class SockaddrHci(ctypes.Structure):
         ("hci_dev", ctypes.c_ushort),
         ("hci_channel", ctypes.c_ushort),
     ]
+
+def set_bt_usb_power(control_mode):
+    if os.environ.get("BT_USB_AUTOSUSPEND_OFF") == "1":
+        control_mode = "on"
+    for dev in glob.glob("/sys/bus/usb/devices/*"):
+        try:
+            with open(f"{dev}/idVendor", "r") as f:
+                if f.read().strip() != "8087":
+                    continue
+            with open(f"{dev}/idProduct", "r") as f:
+                if f.read().strip() != "0026":
+                    continue
+            delay_path = f"{dev}/power/autosuspend_delay_ms"
+            if os.path.exists(delay_path):
+                with open(delay_path, "w") as f:
+                    f.write("2000")
+            ctrl_path = f"{dev}/power/control"
+            if os.path.exists(ctrl_path):
+                with open(ctrl_path, "w") as f:
+                    f.write(control_mode)
+        except Exception:
+            pass
+
+def find_btadapterd_pids():
+    pids = []
+    for cmd_path in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            with open(cmd_path, "rb") as f:
+                raw = f.read()
+            if b"/usr/bin/btadapterd" in raw:
+                pids.append(int(cmd_path.split("/")[2]))
+        except Exception:
+            continue
+    return pids
 
 def patch_btadapterd_wbs_in_ram(pid):
     try:
@@ -157,13 +205,7 @@ def read_altsetting():
     return None
 
 def attach_btadapterd(patched_pids):
-    try:
-        pids = subprocess.check_output(["pgrep", "-f", "/usr/bin/btadapterd"], text=True).split()
-    except Exception:
-        return None, None
-
-    for pid_str in pids:
-        pid = int(pid_str)
+    for pid in find_btadapterd_pids():
         pidfd = libc.syscall(SYS_pidfd_open, ctypes.c_int(pid), ctypes.c_uint(0))
         if pidfd < 0:
             continue
@@ -227,6 +269,7 @@ def open_raw_monitor(dev_id=0):
 def main():
     patched_pids = set()
     checked_early_nb_mic = False
+    set_bt_usb_power("auto")
 
     while True:
         raw_sock = None
@@ -261,7 +304,7 @@ def main():
                         except Exception:
                             pass
 
-                timeout = 0.2 if user_fd is None else 1.0
+                timeout = 0.5 if user_fd is None else 2.0
                 rlist, _, _ = select.select([raw_sock], [], [], timeout)
                 if not rlist:
                     continue
@@ -274,6 +317,8 @@ def main():
                 if evt == 0x0E and len(pkt) >= 6:
                     opcode = struct.unpack_from("<H", pkt, 4)[0]
                     if opcode == 0x0C03:
+                        sco_handles.clear()
+                        set_bt_usb_power("auto")
                         send_intel_sco_over_usb(raw_sock)
                         if user_fd is not None:
                             try:
@@ -289,6 +334,7 @@ def main():
                     print(f"eSCO Connect Complete: status=0x{status:02x} handle={handle} air_mode=0x{air_mode:02x}")
                     if status == 0x00:
                         sco_handles.add(handle)
+                        set_bt_usb_power("on")
                         if user_fd is None or not os.path.exists(f"/proc/{current_pid}"):
                             if user_fd is not None:
                                 try:
@@ -307,8 +353,10 @@ def main():
                     handle = struct.unpack_from("<H", pkt, 4)[0] & 0x0FFF
                     if handle in sco_handles:
                         sco_handles.discard(handle)
-                        if not sco_handles and user_fd is not None:
-                            switch_usb_altsetting(user_fd, 0)
+                        if not sco_handles:
+                            if user_fd is not None:
+                                switch_usb_altsetting(user_fd, 0)
+                            set_bt_usb_power("auto")
         except Exception as e:
             print(f"Loop exception: {e}")
             if user_fd is not None:
@@ -329,7 +377,14 @@ PY_EOF
 end script
 EOF
 if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 1))); fi
-chmod 0644 /roota/etc/init/x1607ca-bt.conf 2>/dev/null || true
-chcon u:object_r:cros_init_conf_file:s0 /roota/etc/init/x1607ca-bt.conf 2>/dev/null || true
+chmod 0644 "${ROOT}/etc/init/x1607ca-bt.conf" 2>/dev/null || true
+chcon u:object_r:cros_init_conf_file:s0 "${ROOT}/etc/init/x1607ca-bt.conf" 2>/dev/null || true
+
+if [ "$LIVE" -eq 1 ]; then
+    udevadm control --reload-rules 2>/dev/null || true
+    initctl reload-configuration 2>/dev/null || true
+    stop x1607ca-bt 2>/dev/null || true
+    start x1607ca-bt 2>/dev/null || true
+fi
 
 exit $ret
