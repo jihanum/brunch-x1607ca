@@ -15,27 +15,6 @@ ret=0
 
 rm -f "$TARGET_ROOT/etc/init/brunch-live-patch.conf" "$TARGET_ROOT/etc/init/brunch-cbx-dlc.conf"
 
-if [ "$MODE_ARG" != "chrome_only" ] && [ -b /dev/nvme0n1p5 ]; then
- mkdir -p /tmp/brunch_rootb
- if mount -o ro /dev/nvme0n1p5 /tmp/brunch_rootb 2>/dev/null; then
-     if [ -f /tmp/brunch_rootb/usr/lib64/libsegmentation.so ]; then
-         cp -af /tmp/brunch_rootb/usr/lib64/libsegmentation.so "$TARGET_ROOT/usr/lib64/libsegmentation.so"
-     fi
-     cp -af /tmp/brunch_rootb/usr/share/chromeos-assets/images_200_percent/boot_splash_frame*.png \
-            "$TARGET_ROOT/usr/share/chromeos-assets/images_200_percent/" 2>/dev/null || true
-     cp -af /tmp/brunch_rootb/usr/share/chromeos-assets/images_100_percent/boot_splash_frame*.png \
-            "$TARGET_ROOT/usr/share/chromeos-assets/images_100_percent/" 2>/dev/null || true
-     umount /tmp/brunch_rootb 2>/dev/null || true
- fi
-fi
-
-ASSETS_DIR="$TARGET_ROOT/usr/share/chromeos-assets"
-if [ -d "$ASSETS_DIR/images_200_percent" ]; then
- mkdir -p "$ASSETS_DIR/animated_splash_screen"
- ln -sfn ../images_200_percent "$ASSETS_DIR/animated_splash_screen/splash_200_percent"
- ln -sfn ../images_100_percent "$ASSETS_DIR/animated_splash_screen/splash_100_percent"
-fi
-
 for CONF_FILE in "$CONF" "$TARGET_ROOT/var/brunch/chrome_dev.conf"; do
  if [ -f "$CONF_FILE" ]; then
      grep -q "^[[:space:]]*--disable-gpu-sandbox" "$CONF_FILE" || echo "--disable-gpu-sandbox" >> "$CONF_FILE"
@@ -45,7 +24,7 @@ for CONF_FILE in "$CONF" "$TARGET_ROOT/var/brunch/chrome_dev.conf"; do
 --feature-management-level=1
 --feature-management-max-level=1
 --feature-management-scope=1
---enable-features=CameraEffectsSupportedByHardware,FeatureManagement16Desks,FeatureManagementBorealis,FeatureManagementMahi,FeatureManagementDriveFsBulkPinning,FeatureManagementGameDashboardRecordGame,FeatureManagementOrca,FeatureManagementSeaPen,FeatureManagementSystemLiveCaption,FeatureManagementTimeOfDayScreenSaver,FeatureManagementTimeOfDayWallpaper,FeatureManagementVideoConference,ICASupportedByHardware,OnDeviceSpeechRecognition,Conch,MagicBoost,Mahi,Orca,VCBackgroundReplace
+--enable-features=CameraEffectsSupportedByHardware,FeatureManagement16Desks,FeatureManagementBorealis,FeatureManagementMahi,FeatureManagementDriveFsBulkPinning,FeatureManagementGameDashboardRecordGame,FeatureManagementOrca,FeatureManagementSeaPen,FeatureManagementTimeOfDayScreenSaver,FeatureManagementTimeOfDayWallpaper,FeatureManagementVideoConference,ICASupportedByHardware,OnDeviceSpeechRecognition,Conch
 # --- CBX_PATCH_END ---
 CBXEOF
  fi
