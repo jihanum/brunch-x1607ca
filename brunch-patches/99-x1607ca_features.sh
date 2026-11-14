@@ -1,12 +1,14 @@
 #!/bin/sh
 # 1. Attempts to add Chromebook Plus features
-# 2. Removes "disable-gpu-sandbox" prompt on every Chrome tab
-#3. Configures Intel NPU (/dev/accel/accel0)
+# 2. Removes "disable-gpu-sandbox" and "WebMachineLearningNeuralNetwork" prompts on every Chrome tab
+# 3. Configures Intel NPU (/dev/accel/accel0)
 
 TARGET_ROOT="/roota"
 if [ "$1" = "/" ] || [ ! -d "/roota/opt/google/chrome" ]; then
  TARGET_ROOT="/"
 fi
+
+mount -o remount,rw "$TARGET_ROOT" 2>/dev/null || true
 
 MODE_ARG="${2:-all}"
 CONF="$TARGET_ROOT/etc/chrome_dev.conf"
@@ -24,7 +26,10 @@ for CONF_FILE in "$CONF" "$TARGET_ROOT/var/brunch/chrome_dev.conf"; do
 --feature-management-level=1
 --feature-management-max-level=1
 --feature-management-scope=1
---enable-features=CameraEffectsSupportedByHardware,FeatureManagement16Desks,FeatureManagementBorealis,FeatureManagementMahi,FeatureManagementDriveFsBulkPinning,FeatureManagementGameDashboardRecordGame,FeatureManagementOrca,FeatureManagementSeaPen,FeatureManagementTimeOfDayScreenSaver,FeatureManagementTimeOfDayWallpaper,FeatureManagementVideoConference,ICASupportedByHardware,OnDeviceSpeechRecognition,Conch
+--enable-gpu-rasterization
+--enable-zero-copy
+--ignore-gpu-blocklist
+--enable-features=WebMachineLearningNeuralNetwork,CameraEffectsSupportedByHardware,FeatureManagement16Desks,FeatureManagementBorealis,FeatureManagementMahi,FeatureManagementDriveFsBulkPinning,FeatureManagementGameDashboardRecordGame,FeatureManagementOrca,FeatureManagementSeaPen,FeatureManagementTimeOfDayScreenSaver,FeatureManagementTimeOfDayWallpaper,FeatureManagementVideoConference,ICASupportedByHardware,OnDeviceSpeechRecognition,Conch
 # --- CBX_PATCH_END ---
 CBXEOF
  fi
@@ -175,17 +180,28 @@ def find_switch_vas(mm, pt_loads, sections, text):
      start = idx + 1
  return vas
 
+def read_feature_name_at_struct_va(mm, pt_loads, sections, struct_va):
+ foff = va_to_foff(pt_loads, sections, struct_va)
+ if foff is None or foff < 0 or foff + 16 > mm.size():
+     return None
+ name_va, default_state = struct.unpack_from("<QI", mm, foff)
+ if default_state not in (0, 1):
+     return None
+ return read_cstring_at_va(mm, pt_loads, sections, name_va)
+
 def patch_chrome_kbadflags(path):
  if not os.path.exists(path):
      return False
+
+ writes = []  # list of (file_offset, cur_val, target_val, label)
 
  with open(path, "rb") as rf:
      rmm = mmap.mmap(rf.fileno(), 0, access=mmap.ACCESS_READ)
      try:
          pt_loads, sections = parse_elf64_layout(rmm)
-         gpu_vas = find_switch_vas(rmm, pt_loads, sections, "disable-gpu-sandbox")
          filesize = rmm.size()
 
+         gpu_vas = find_switch_vas(rmm, pt_loads, sections, "disable-gpu-sandbox")
          kbadflags_markers = {
              "ignore-certificate-errors-spki-list",
              "disable-web-security",
@@ -212,32 +228,91 @@ def patch_chrome_kbadflags(path):
                      if "disable-seccomp-filter-sandbox" in nbr_strings or (nbr_strings & kbadflags_markers):
                          candidates.append((pos, cur_va, va_gpu, nbr_strings))
                      pos = rmm.find(packed, pos + 1)
+
+         if not candidates:
+             print("chrome: no switch tables referencing disable-gpu-sandbox found")
+             return False
+
+         kbad_positions = {pos for pos, _, _, nbrs in candidates if (nbrs & kbadflags_markers)}
+         if not kbad_positions:
+             kbad_positions = {max(pos for pos, _, _, _ in candidates)}
+
+         for pos, cur_va, va_gpu, nbrs in candidates:
+             if pos in kbad_positions:
+                 target_va = va_gpu + 1
+                 role = "kBadFlags_SHIFT"
+             else:
+                 target_va = va_gpu
+                 role = "GpuProcessHost_KEEP_INTACT"
+             print(f"chrome: [{role}] at {hex(pos)}: cur={hex(cur_va)} -> target={hex(target_va)} (neighbors={sorted(list(nbrs))[:5]})")
+             writes.append((pos, cur_va, target_va, role))
+
+         needle_webnn = b"WebMachineLearningNeuralNetwork\x00"
+         webnn_str_vas = set()
+         s_idx = 0
+         while True:
+             s_idx = rmm.find(needle_webnn, s_idx)
+             if s_idx == -1:
+                 break
+             webnn_str_vas |= foff_to_vas(pt_loads, sections, s_idx)
+             s_idx += 1
+
+         webnn_struct_vas = set()
+         for str_va in sorted(webnn_str_vas):
+             packed_str = struct.pack("<Q", str_va)
+             pos = rmm.find(packed_str)
+             while pos != -1:
+                 if pos % 8 == 0 and pos + 16 <= filesize:
+                     _, default_state = struct.unpack_from("<QI", rmm, pos)
+                     if default_state in (0, 1):
+                         webnn_struct_vas |= foff_to_vas(pt_loads, sections, pos)
+                 pos = rmm.find(packed_str, pos + 1)
+
+         bad_feat_markers = {
+             "IsolatedWebAppDevMode",
+             "BypassPepcSecurityForTesting",
+             "TestRootStore",
+             "UnsafeUnboundedElementOnTheOpenWeb",
+             "WebGPUDeveloperFeatures",
+             "ExperimentalWebAssembly",
+             "EnableWebAssemblyLazyCompilation",
+             "OriginTrials",
+             "SafeBrowsingSkipSubresources",
+         }
+
+         feat_table_hits = []
+         for f_va in sorted(webnn_struct_vas):
+             packed_f = struct.pack("<Q", f_va)
+             pos = rmm.find(packed_f)
+             while pos != -1:
+                 if pos % 8 == 0:
+                     nbr_feats = {}
+                     for delta in range(-96, 104, 8):
+                         if delta == 0 or not (0 <= pos + delta <= filesize - 8):
+                             continue
+                         nbr_fva = struct.unpack_from("<Q", rmm, pos + delta)[0]
+                         fname = read_feature_name_at_struct_va(rmm, pt_loads, sections, nbr_fva)
+                         if fname:
+                             nbr_feats[fname] = nbr_fva
+                     matched_markers = set(nbr_feats.keys()) & bad_feat_markers
+                     if matched_markers:
+                         donor_name = sorted(matched_markers)[0]
+                         donor_va = nbr_feats[donor_name]
+                         feat_table_hits.append((pos, f_va, donor_va, donor_name, sorted(nbr_feats.keys())[:5]))
+                 pos = rmm.find(packed_f, pos + 1)
+
+         if feat_table_hits:
+             for pos, cur_fva, donor_va, donor_name, sample_feats in feat_table_hits:
+                 role = f"kBadFeatureFlags_REPLACE_WITH_{donor_name}"
+                 print(f"chrome: [{role}] at {hex(pos)}: cur={hex(cur_fva)} -> target={hex(donor_va)} (neighbors={sample_feats})")
+                 writes.append((pos, cur_fva, donor_va, role))
+         else:
+             print("chrome: kBadFeatureFlagsInAboutFlags entry for WebNN already patched or not found")
+
      finally:
          rmm.close()
 
- if not candidates:
-     print("chrome: no switch tables referencing disable-gpu-sandbox found")
-     return False
-
- kbad_positions = {pos for pos, _, _, nbrs in candidates if (nbrs & kbadflags_markers)}
- if not kbad_positions:
-     highest_pos = max(pos for pos, _, _, _ in candidates)
-     kbad_positions = {highest_pos}
-
- operations = []
- for pos, cur_va, va_gpu, nbrs in candidates:
-     if pos in kbad_positions:
-         target_va = va_gpu + 1
-         role = "kBadFlags_SHIFT"
-     else:
-         target_va = va_gpu
-         role = "GpuProcessHost_KEEP_INTACT"
-     operations.append((pos, cur_va, target_va, role, sorted(list(nbrs))[:5]))
-
- for pos, cur_va, target_va, role, sample_nbrs in operations:
-     print(f"chrome: [{role}] at {hex(pos)}: cur={hex(cur_va)} -> target={hex(target_va)} (neighbors={sample_nbrs})")
-
- if all(cur_va == target_va for _, cur_va, target_va, _, _ in operations):
+ if all(cur == tgt for _, cur, tgt, _ in writes):
      print("chrome: all slots already in desired state")
      return True
 
@@ -245,10 +320,10 @@ def patch_chrome_kbadflags(path):
      with open(path, "r+b") as wf:
          wmm = mmap.mmap(wf.fileno(), 0, access=mmap.ACCESS_WRITE)
          try:
-             for pos, cur_va, target_va, role, _ in operations:
-                 if cur_va != target_va:
-                     struct.pack_into("<Q", wmm, pos, target_va)
-                     print(f"chrome: updated [{role}] at {hex(pos)} ({hex(cur_va)} -> {hex(target_va)})")
+             for pos, cur, tgt, role in writes:
+                 if cur != tgt:
+                     struct.pack_into("<Q", wmm, pos, tgt)
+                     print(f"chrome: updated [{role}] at {hex(pos)} ({hex(cur)} -> {hex(tgt)})")
              wmm.flush()
              return True
          finally:
