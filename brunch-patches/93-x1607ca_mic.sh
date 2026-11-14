@@ -19,7 +19,7 @@ select_internal_mic() {
     [ -z "$target_node" ] && return 0
 
     cras_test_client --select_input "$target_node" >/dev/null 2>&1 || true
-    cras_test_client --capture_gain 500 >/dev/null 2>&1 || true
+    cras_test_client --capture_gain 2000 >/dev/null 2>&1 || true
 
     local dev_id="${target_node%%:*}"
     local sub_id="${target_node#*:}"
@@ -27,7 +27,7 @@ select_internal_mic() {
         local node_uint64=$(( (dev_id << 32) | sub_id ))
         dbus-send --system --type=method_call --dest=org.chromium.cras \
             /org/chromium/cras org.chromium.cras.Control.SetInputNodeGain \
-            "uint64:${node_uint64}" int32:63 >/dev/null 2>&1 || true
+            "uint64:${node_uint64}" int32:100 >/dev/null 2>&1 || true
     fi
 }
 
