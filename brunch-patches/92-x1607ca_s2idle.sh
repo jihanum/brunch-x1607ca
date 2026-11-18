@@ -46,7 +46,9 @@ if [ -d "${ROOT}/usr/share/power_manager" ]; then
 fi
 
 if [ -f "${ROOT}/lib/udev/rules.d/99-x1607ca-uhid.rules" ]; then
-    sed -i 's/ATTR{power\/control}="on"/ATTR{power\/control}="auto", ATTR{power\/autosuspend_delay_ms}="2000"/g' \
+    sed -i 's/ATTR{power\/control}="auto",[[:space:]]*ATTR{power\/autosuspend_delay_ms}="2000"/ATTR{power\/control}="on"/g' \
+        "${ROOT}/lib/udev/rules.d/99-x1607ca-uhid.rules" 2>/dev/null || true
+    sed -i 's/ATTR{power\/control}="auto"/ATTR{power\/control}="on"/g' \
         "${ROOT}/lib/udev/rules.d/99-x1607ca-uhid.rules" 2>/dev/null || true
 fi
 if [ -f "${ROOT}/etc/modprobe.d/99-x1607ca-btusb.conf" ]; then
@@ -78,12 +80,19 @@ pre-start script
     [ -w /sys/power/pm_trace ] && echo 0 > /sys/power/pm_trace 2>/dev/null || true
 
     if [ -r /proc/acpi/wakeup ] && [ -w /proc/acpi/wakeup ]; then
-        for dev in RP10 TXHC XHCI; do
-            if grep -q "^${dev}[[:space:]].*\*enabled" /proc/acpi/wakeup; then
+        if grep -q "^RP10[[:space:]].*\*enabled" /proc/acpi/wakeup; then
+            echo "RP10" > /proc/acpi/wakeup 2>/dev/null || true
+        fi
+        for dev in XHCI TXHC CNVW LID0; do
+            if grep -q "^${dev}[[:space:]].*\*disabled" /proc/acpi/wakeup; then
                 echo "$dev" > /proc/acpi/wakeup 2>/dev/null || true
             fi
         done
     fi
+
+    for phy in /sys/class/ieee80211/*; do
+        [ -e "$phy" ] && iw "$(basename "$phy")" wowlan enable disconnect 2>/dev/null || true
+    done
 
     mkdir -p /var/lib/power_manager
     echo 1 > /var/lib/power_manager/suspend_to_idle
@@ -111,10 +120,13 @@ script
 import glob
 import os
 import struct
+import subprocess
 import time
 
 UNBOUND_BDFS = ("0000:00:08.0", "0000:00:0a.0", "0000:00:14.2")
 LTR_INDICES = (3, 4, 6, 9, 10, 11, 12, 15, 17, 21, 22, 24, 31, 32, 34, 37, 38, 39, 40)
+HID_DRIVERS = ("usbhid", "usbkbd", "usbmouse", "xpad")
+NO_WAKE_USB_IDS = (("8087", "0026"), ("3277", "0018"))
 
 def write_sysfs(path, val):
     try:
@@ -129,6 +141,57 @@ def read_sysfs(path):
             return f.read().strip()
     except Exception:
         return ""
+
+def is_usb_hid(dev_path):
+    base = os.path.basename(dev_path)
+    if ":" in base or base.startswith("usb"):
+        return False
+    if read_sysfs(f"{dev_path}/bDeviceClass").lower() == "03":
+        return True
+    for intf in glob.glob(f"{dev_path}:*"):
+        if read_sysfs(f"{intf}/bInterfaceClass").lower() == "03":
+            return True
+        drv_link = f"{intf}/driver"
+        if os.path.islink(drv_link):
+            try:
+                if os.path.basename(os.readlink(drv_link)) in HID_DRIVERS:
+                    return True
+            except Exception:
+                pass
+        if glob.glob(f"{intf}/0003:*"):
+            return True
+    return False
+
+def configure_usb_pm():
+    for u in glob.glob("/sys/bus/usb/devices/*"):
+        base = os.path.basename(u)
+        if ":" in base:
+            continue
+        ctrl_path = f"{u}/power/control"
+        if not os.path.exists(ctrl_path):
+            continue
+        vid = read_sysfs(f"{u}/idVendor").lower()
+        pid = read_sysfs(f"{u}/idProduct").lower()
+        wake_path = f"{u}/power/wakeup"
+        if (vid, pid) in NO_WAKE_USB_IDS and os.path.exists(wake_path):
+            if read_sysfs(wake_path) == "enabled":
+                write_sysfs(wake_path, "disabled")
+        delay_path = f"{u}/power/autosuspend_delay_ms"
+        if is_usb_hid(u):
+            if read_sysfs(ctrl_path) != "on":
+                write_sysfs(ctrl_path, "on")
+            if os.path.exists(wake_path) and read_sysfs(wake_path) == "disabled":
+                write_sysfs(wake_path, "enabled")
+        else:
+            if os.path.exists(delay_path):
+                try:
+                    if int(read_sysfs(delay_path)) < 0:
+                        target = "0" if base.startswith("usb") else "2000"
+                        write_sysfs(delay_path, target)
+                except Exception:
+                    pass
+            if read_sysfs(ctrl_path) != "auto":
+                write_sysfs(ctrl_path, "auto")
 
 def force_d3hot(bdf):
     drv_path = f"/sys/bus/pci/devices/{bdf}/driver"
@@ -177,18 +240,11 @@ def apply_all():
         if os.path.exists(lat):
             write_sysfs(lat, "100000")
 
-    for u in glob.glob("/sys/bus/usb/devices/*"):
-        delay_path = f"{u}/power/autosuspend_delay_ms"
-        if os.path.exists(delay_path):
-            try:
-                if int(read_sysfs(delay_path)) < 0:
-                    target = "0" if os.path.basename(u).startswith("usb") else "2000"
-                    write_sysfs(delay_path, target)
-            except Exception:
-                pass
-        ctrl_path = f"{u}/power/control"
-        if os.path.exists(ctrl_path) and read_sysfs(ctrl_path) != "auto":
-            write_sysfs(ctrl_path, "auto")
+    for phy in glob.glob("/sys/class/ieee80211/*"):
+        subprocess.run(["iw", os.path.basename(phy), "wowlan", "enable", "disconnect"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+    configure_usb_pm()
 
     for pattern in (
         "/sys/bus/pci/devices/*/power/control",
@@ -223,16 +279,7 @@ while True:
     for bdf in UNBOUND_BDFS:
         if read_sysfs(f"/sys/bus/pci/devices/{bdf}/power_state") == "D0":
             force_d3hot(bdf)
-    for u in glob.glob("/sys/bus/usb/devices/*"):
-        ctrl_path = f"{u}/power/control"
-        if os.path.exists(ctrl_path) and read_sysfs(ctrl_path) != "auto":
-            delay_path = f"{u}/power/autosuspend_delay_ms"
-            try:
-                if int(read_sysfs(delay_path)) < 0:
-                    write_sysfs(delay_path, "0" if os.path.basename(u).startswith("usb") else "2000")
-            except Exception:
-                pass
-            write_sysfs(ctrl_path, "auto")
+    configure_usb_pm()
 PYEOF
 end script
 EOF
@@ -241,6 +288,8 @@ chmod 0644 "$UPSTART_CONF"
 restore_selinux_file "$REF_INIT" "$UPSTART_CONF" "u:object_r:cros_init_conf_file:s0"
 
 if [ "$LIVE" -eq 1 ]; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=usb --subsystem-match=input 2>/dev/null || true
     initctl reload-configuration 2>/dev/null || true
     stop lnl-s2idle 2>/dev/null || true
     start lnl-s2idle 2>/dev/null || true
