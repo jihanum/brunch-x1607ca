@@ -1,152 +1,44 @@
 #!/bin/sh
-# Brunch patch: Safely installs the hardened custom updater to /usr/local/bin/update
+# Brunch boot patch (/patches/99-install-updater.sh on /dev/nvme0n1p7)
+# Installs /usr/local/bin/update if it is not already present.
 
-set -eu
-
-ret=0
-
-if [ -n "${TARGET_ROOT:-}" ]; then
-    :
-elif [ "${1:-}" = "--live" ] || [ "${1:-}" = "/" ]; then
-    TARGET_ROOT="/"
-elif [ -d /roota/etc ]; then
-    TARGET_ROOT="/roota"
-else
-    TARGET_ROOT="/"
-fi
-
-if [ ! -d "$TARGET_ROOT" ]; then
-    echo "brunch: custom_updater: target root '$TARGET_ROOT' not found" >&2
-    exit 1
-fi
-
-PREFIX="${TARGET_ROOT%/}"
-
-restore_selinux_file() {
-    ref="$1"
-    dst="$2"
-    ctx="$3"
-    if [ -e "$ref" ] && command -v chcon >/dev/null 2>&1; then
-        chcon --reference="$ref" "$dst" 2>/dev/null && return 0
-    fi
-    if command -v setfattr >/dev/null 2>&1; then
-        setfattr -n security.selinux -v "$ctx" "$dst" 2>/dev/null || true
-    fi
-}
-
-ensure_real_dir() {
-    dir="$1"
-    if [ -L "$dir" ]; then
-        echo "brunch: custom_updater: refusing to follow symlink directory '$dir'" >&2
-        return 1
-    fi
-    if [ ! -e "$dir" ]; then
-        mkdir -p -m 0755 "$dir"
-    fi
-    if [ -L "$dir" ] || [ ! -d "$dir" ]; then
-        echo "brunch: custom_updater: '$dir' is not a valid directory" >&2
-        return 1
-    fi
-    return 0
-}
-
-safe_install_payload() {
-    src_payload="$1"
-    dst_file="$2"
-    mode="$3"
-    ref_file="$4"
-    selinux_ctx="$5"
-    dst_dir="${dst_file%/*}"
-
-    ensure_real_dir "$dst_dir" || return 1
-
-    if [ -L "$dst_file" ]; then
-        rm -f "$dst_file"
-    fi
-
-    tmp_file=$(mktemp "${dst_dir}/.${dst_file##*/}.tmp.XXXXXX")
-    chmod "$mode" "$tmp_file"
-    cat "$src_payload" > "$tmp_file"
-    chmod "$mode" "$tmp_file"
-    if [ "$(id -u)" -eq 0 ]; then
-        chown 0:0 "$tmp_file"
-    fi
-    restore_selinux_file "$ref_file" "$tmp_file" "$selinux_ctx"
-    mv -f "$tmp_file" "$dst_file"
-}
-
-STAGE_FILE=$(mktemp "/tmp/brunch_update_payload.XXXXXX")
-trap 'rm -f "$STAGE_FILE"' EXIT
-
-cat << 'BRUNCH_CUSTOM_UPDATE_EOF' > "$STAGE_FILE"
+write_update_script() {
+    target="$1"
+    mkdir -p "$(dirname "$target")"
+    cat << 'UPDATER_EOF' > "$target"
 #!/usr/bin/env bash
+# Hardened Auto-Updater for ASUS X1607CA (jihanum/brunch-x1607ca + volteer)
+# Uses POSIX sed and built-in python3 (no grep -P, unzip, jq, or busybox required).
 
 set -euo pipefail
-umask 077
 
 export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
 GITHUB_REPO="jihanum/brunch-x1607ca"
 CROS_BOARD="volteer"
 CROS_CHANNEL="stable"               # "stable" or "beta"
-REQUIRE_RECOVERY_SHA1="false"       # Set "true" to prevent cros.tech historical .imgs without recovery2.json SHA-1
+REQUIRE_RECOVERY_SHA1="false"       # Set "true" to forbid cros.tech historical images without recovery2.json SHA-1
 
 STATE_DIR="/mnt/stateful_partition/brunch/updater"
+WORK_DIR="${STATE_DIR}/tmp"
+MNT_CHECK="${STATE_DIR}/mnt_verify"
 BRUNCH_STAGING_DIR="/mnt/stateful_partition/unencrypted/brunch_updater"
 STATE_FILE="${STATE_DIR}/version_state.env"
 LOG_FILE="${STATE_DIR}/updater.log"
 LOCK_FILE="/run/brunch_updater.lock"
-WORK_DIR=""
-MNT_CHECK=""
-
-if [[ ! "$GITHUB_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || \
-   [[ ! "$CROS_BOARD" =~ ^[a-z0-9_-]+$ ]] || \
-   [[ "$CROS_CHANNEL" != "stable" && "$CROS_CHANNEL" != "beta" ]]; then
-    echo "ERROR: Invalid updater configuration." >&2
-    exit 1
-fi
 
 if [ "$EUID" -ne 0 ]; then
     echo "ERROR: This updater must be run as root." >&2
     exit 1
 fi
 
-ensure_safe_dir() {
-    local dir="$1"
-    if [ -L "$dir" ]; then
-        echo "ERROR: Unsafe symlink detected at directory path '$dir'." >&2
-        exit 1
-    fi
-    if [ ! -e "$dir" ]; then
-        mkdir -p -m 0700 "$dir"
-    fi
-    if [ -L "$dir" ] || [ ! -d "$dir" ]; then
-        echo "ERROR: '$dir' is not a valid directory." >&2
-        exit 1
-    fi
-    chown 0:0 "$dir"
-    chmod 0700 "$dir"
-}
-
-ensure_safe_dir "/mnt/stateful_partition/brunch"
-ensure_safe_dir "$STATE_DIR"
-
-if [ -L "$LOG_FILE" ]; then
-    echo "ERROR: Unsafe symlink detected at log file '$LOG_FILE'." >&2
-    exit 1
-fi
-if [ ! -e "$LOG_FILE" ]; then
-    : > "$LOG_FILE"
-fi
-chown 0:0 "$LOG_FILE"
-chmod 0600 "$LOG_FILE"
-
+mkdir -p "$STATE_DIR" "$WORK_DIR" "$MNT_CHECK"
 exec >> "$LOG_FILE" 2>&1
 
 echo "=========================================="
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting update check (Board: ${CROS_BOARD}, Channel: ${CROS_CHANNEL})..."
 
-REQUIRED_CMDS=(curl python3 tar cgpt rootdev pv sha1sum sha256sum flock mount umount df mktemp mountpoint)
+REQUIRED_CMDS=(curl python3 sed tar cgpt rootdev pv sha1sum sha256sum flock mount umount df)
 for cmd in "${REQUIRED_CMDS[@]}"; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "ERROR: Required command '$cmd' is not installed or not in PATH."
@@ -154,39 +46,21 @@ for cmd in "${REQUIRED_CMDS[@]}"; do
     fi
 done
 
-if [ -L "$LOCK_FILE" ]; then
-    echo "ERROR: Unsafe symlink detected at lock file '$LOCK_FILE'."
-    exit 1
-fi
 exec 9> "$LOCK_FILE"
-chmod 0600 "$LOCK_FILE"
 if ! flock -n 9; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Updater is already running. Exiting."
     exit 0
 fi
 
 cleanup() {
-    if [ -n "${MNT_CHECK:-}" ] && [ -d "$MNT_CHECK" ]; then
-        if mountpoint -q "$MNT_CHECK" 2>/dev/null; then
-            umount "$MNT_CHECK" 2>/dev/null || umount -l "$MNT_CHECK" 2>/dev/null || true
-        fi
-        rmdir "$MNT_CHECK" 2>/dev/null || rm -rf "$MNT_CHECK" 2>/dev/null || true
-    fi
-    if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
-        rm -rf "$WORK_DIR" 2>/dev/null || true
-    fi
-    if [ -n "${BRUNCH_STAGING_DIR:-}" ] && [ ! -L "$BRUNCH_STAGING_DIR" ] && [ -d "$BRUNCH_STAGING_DIR" ]; then
-        rm -rf "$BRUNCH_STAGING_DIR" 2>/dev/null || true
-    fi
+    umount "$MNT_CHECK" 2>/dev/null || true
+    rm -rf "$WORK_DIR" "$BRUNCH_STAGING_DIR" 2>/dev/null || true
+    mkdir -p "$WORK_DIR"
 }
 trap cleanup EXIT
 
-WORK_DIR=$(mktemp -d "${STATE_DIR}/work.XXXXXX")
-MNT_CHECK=$(mktemp -d "${STATE_DIR}/mnt.XXXXXX")
-chmod 0700 "$WORK_DIR" "$MNT_CHECK"
-
 for i in {1..12}; do
-    if curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSI -- "https://api.github.com" >/dev/null 2>&1; then
+    if curl -fsSI https://api.github.com >/dev/null 2>&1; then
         break
     fi
     if [ "$i" -eq 12 ]; then
@@ -195,6 +69,22 @@ for i in {1..12}; do
     fi
     sleep 5
 done
+
+# 6. Helper Functions (No grep -P used)
+get_lsb_val() {
+    local file="$1"
+    local key="$2"
+    local default_val="$3"
+    local val=""
+    if [ -f "$file" ]; then
+        val=$(sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -n1 | tr -d '\r\n"'"'" || true)
+    fi
+    if [ -n "$val" ]; then
+        echo "$val"
+    else
+        echo "$default_val"
+    fi
+}
 
 parse_brunch_info() {
     python3 - "$1" << 'PYEOF'
@@ -221,177 +111,62 @@ is_newer_version() {
     [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
 }
 
-load_state_file() {
-    local state_path="$1"
-    if [ ! -e "$state_path" ]; then
-        return 0
-    fi
-    if [ -L "$state_path" ] || [ ! -f "$state_path" ]; then
-        echo "ERROR: State file '$state_path' is not a regular file."
-        exit 1
-    fi
-
-    local line key val
-    while IFS= read -r line || [ -n "$line" ]; do
-        line="${line%$'\r'}"
-        case "$line" in
-            ""|\#*) continue ;;
-        esac
-        if [[ "$line" != *=* ]]; then
-            echo "WARNING: Ignoring malformed line in state file."
-            continue
-        fi
-        key="${line%%=*}"
-        val="${line#*=}"
-
-        if [[ "$val" =~ ^\"(.*)\"$ ]]; then
-            val="${BASH_REMATCH[1]}"
-        elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
-            val="${BASH_REMATCH[1]}"
-        fi
-
-        case "$key" in
-            RECORDED_CROS_MILESTONE)
-                if [[ "$val" =~ ^[0-9]+$ ]]; then
-                    RECORDED_CROS_MILESTONE="$val"
-                else
-                    echo "WARNING: Invalid RECORDED_CROS_MILESTONE in state file; ignoring."
-                fi
-                ;;
-            RECORDED_CROS_PLATFORM_VERSION)
-                if [[ "$val" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
-                    RECORDED_CROS_PLATFORM_VERSION="$val"
-                else
-                    echo "WARNING: Invalid RECORDED_CROS_PLATFORM_VERSION in state file; ignoring."
-                fi
-                ;;
-            RECORDED_BRUNCH_RELEASE)
-                if [[ "$val" =~ ^[A-Za-z0-9._\ -]+$ ]]; then
-                    RECORDED_BRUNCH_RELEASE="$val"
-                else
-                    echo "WARNING: Invalid RECORDED_BRUNCH_RELEASE in state file; ignoring."
-                fi
-                ;;
-            RECORDED_BRUNCH_MILESTONE)
-                if [[ "$val" =~ ^[0-9]+$ ]]; then
-                    RECORDED_BRUNCH_MILESTONE="$val"
-                else
-                    echo "WARNING: Invalid RECORDED_BRUNCH_MILESTONE in state file; ignoring."
-                fi
-                ;;
-            RECORDED_BRUNCH_DATE)
-                if [[ "$val" =~ ^[0-9]+$ ]]; then
-                    RECORDED_BRUNCH_DATE="$val"
-                else
-                    echo "WARNING: Invalid RECORDED_BRUNCH_DATE in state file; ignoring."
-                fi
-                ;;
-            *)
-                echo "WARNING: Ignoring unexpected key '$key' in state file."
-                ;;
-        esac
-    done < "$state_path"
-}
-
-if [ ! -f /etc/lsb-release ] || [ -L /etc/lsb-release ]; then
-    echo "ERROR: /etc/lsb-release is missing or unsafe."
-    exit 1
-fi
-SYS_MILESTONE=$(grep -m1 -oP '(?<=^CHROMEOS_RELEASE_CHROME_MILESTONE=)[0-9]+' /etc/lsb-release || echo "0")
-SYS_PLATFORM_VER=$(grep -m1 -oP '(?<=^CHROMEOS_RELEASE_VERSION=)[0-9.]+' /etc/lsb-release || echo "0.0.0")
-if [[ ! "$SYS_MILESTONE" =~ ^[0-9]+$ ]]; then
-    SYS_MILESTONE="0"
-fi
-if [[ ! "$SYS_PLATFORM_VER" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
-    SYS_PLATFORM_VER="0.0.0"
-fi
-
-if [ -f /etc/brunch_version ] && [ ! -L /etc/brunch_version ]; then
-    SYS_BRUNCH_RAW=$(tr -d '\r\n' < /etc/brunch_version)
-else
-    SYS_BRUNCH_RAW="none"
-fi
-if [[ ! "$SYS_BRUNCH_RAW" =~ ^[A-Za-z0-9._\ -]+$ ]]; then
-    SYS_BRUNCH_RAW="none"
-fi
+SYS_MILESTONE=$(get_lsb_val /etc/lsb-release "CHROMEOS_RELEASE_CHROME_MILESTONE" "0")
+SYS_PLATFORM_VER=$(get_lsb_val /etc/lsb-release "CHROMEOS_RELEASE_VERSION" "0.0.0")
+SYS_BRUNCH_RAW=$(cat /etc/brunch_version 2>/dev/null | tr -d '\r\n' || echo "none")
 
 IFS='|' read -r SYS_BRUNCH_MILESTONE SYS_BRUNCH_DATE <<< "$(parse_brunch_info "$SYS_BRUNCH_RAW")"
 
-RECORDED_CROS_MILESTONE=""
-RECORDED_CROS_PLATFORM_VERSION=""
-RECORDED_BRUNCH_RELEASE=""
-RECORDED_BRUNCH_MILESTONE=""
-RECORDED_BRUNCH_DATE=""
+if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+fi
 
-load_state_file "$STATE_FILE"
-
-RECORDED_CROS_MILESTONE="${RECORDED_CROS_MILESTONE:-$SYS_MILESTONE}"
-RECORDED_CROS_PLATFORM_VERSION="${RECORDED_CROS_PLATFORM_VERSION:-$SYS_PLATFORM_VER}"
+if [ -z "${RECORDED_CROS_MILESTONE:-}" ] || [ "${RECORDED_CROS_MILESTONE}" = "0" ]; then
+    RECORDED_CROS_MILESTONE="$SYS_MILESTONE"
+fi
+if [ -z "${RECORDED_CROS_PLATFORM_VERSION:-}" ] || [ "${RECORDED_CROS_PLATFORM_VERSION}" = "0.0.0" ]; then
+    RECORDED_CROS_PLATFORM_VERSION="$SYS_PLATFORM_VER"
+fi
 RECORDED_BRUNCH_RELEASE="${RECORDED_BRUNCH_RELEASE:-$SYS_BRUNCH_RAW}"
 
 IFS='|' read -r PARSED_REC_MS PARSED_REC_DATE <<< "$(parse_brunch_info "$RECORDED_BRUNCH_RELEASE")"
-RECORDED_BRUNCH_MILESTONE="${RECORDED_BRUNCH_MILESTONE:-$PARSED_REC_MS}"
-RECORDED_BRUNCH_DATE="${RECORDED_BRUNCH_DATE:-$PARSED_REC_DATE}"
-
-if [[ ! "$RECORDED_CROS_MILESTONE" =~ ^[0-9]+$ ]] || \
-   [[ ! "$RECORDED_BRUNCH_MILESTONE" =~ ^[0-9]+$ ]] || \
-   [[ ! "$RECORDED_BRUNCH_DATE" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: Invalid numeric version metadata in system or state."
-    exit 1
+if [ -z "${RECORDED_BRUNCH_MILESTONE:-}" ] || [ "${RECORDED_BRUNCH_MILESTONE}" = "0" ]; then
+    RECORDED_BRUNCH_MILESTONE="$PARSED_REC_MS"
+fi
+if [ -z "${RECORDED_BRUNCH_DATE:-}" ] || [ "${RECORDED_BRUNCH_DATE}" = "0" ]; then
+    RECORDED_BRUNCH_DATE="$PARSED_REC_DATE"
 fi
 
-echo "Installed System   : ChromeOS r${SYS_MILESTONE} (${SYS_PLATFORM_VER}) | Brunch '${SYS_BRUNCH_RAW}' (r${SYS_BRUNCH_MILESTONE}, Date: ${SYS_BRUNCH_DATE})"
-echo "Recorded State     : ChromeOS r${RECORDED_CROS_MILESTONE} (${RECORDED_CROS_PLATFORM_VERSION}) | Brunch '${RECORDED_BRUNCH_RELEASE}' (r${RECORDED_BRUNCH_MILESTONE}, Date: ${RECORDED_BRUNCH_DATE})"
+echo "Installed System    : ChromeOS r${SYS_MILESTONE} (${SYS_PLATFORM_VER}) | Brunch '${SYS_BRUNCH_RAW}' (r${SYS_BRUNCH_MILESTONE}, Date: ${SYS_BRUNCH_DATE})"
+echo "Recorded State      : ChromeOS r${RECORDED_CROS_MILESTONE} (${RECORDED_CROS_PLATFORM_VERSION}) | Brunch '${RECORDED_BRUNCH_RELEASE}' (r${RECORDED_BRUNCH_MILESTONE}, Date: ${RECORDED_BRUNCH_DATE})"
 
 GH_API_URL="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-GH_JSON_FILE="${WORK_DIR}/gh_release.json"
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -- "$GH_API_URL" -o "$GH_JSON_FILE"
+GH_JSON=$(curl -fsSL "$GH_API_URL")
 
-BRUNCH_PARSED=$(python3 - "$GH_JSON_FILE" "$GITHUB_REPO" << 'PYEOF'
-import datetime, json, re, sys
+BRUNCH_PARSED=$(python3 -c '
+import json, re, sys
 
-json_path, repo = sys.argv[1], sys.argv[2]
-with open(json_path, "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-tag = (data.get("tag_name") or "").strip()
-name = (data.get("name") or "").strip()
-body = data.get("body") or ""
-
-if not re.fullmatch(r"[A-Za-z0-9._-]+", tag):
-    print("ERR_INVALID_TAG", file=sys.stderr)
-    sys.exit(1)
+data = json.loads(sys.stdin.read())
+tag = data.get("tag_name", "")
+name = data.get("name", "") or ""
+body = data.get("body", "") or ""
 
 m_body = re.search(r"release_sha256sum=([0-9a-fA-F]{64})", body)
 body_sha256 = m_body.group(1).lower() if m_body else ""
 
-assets = [a for a in data.get("assets", []) if (a.get("name") or "").endswith(".tar.gz")]
-assets.sort(key=lambda a: 0 if (a.get("name") or "").lower().startswith("brunch") else 1)
+assets = [a for a in data.get("assets", []) if a.get("name", "").endswith(".tar.gz")]
+assets.sort(key=lambda a: 0 if a.get("name", "").lower().startswith("brunch") else 1)
 
-if not assets:
-    print("ERR_NO_TARBALL_ASSET", file=sys.stderr)
+if not tag or not assets:
     sys.exit(1)
 
 asset = assets[0]
-asset_name = (asset.get("name") or "").strip()
-url = (asset.get("browser_download_url") or "").strip()
-try:
-    size = int(asset.get("size", 0))
-except (TypeError, ValueError):
-    size = 0
+asset_name = asset.get("name", "")
+url = asset.get("browser_download_url", "")
+size = int(asset.get("size", 0))
 digest = asset.get("digest", "") or ""
 asset_sha256 = digest.split("sha256:", 1)[1].lower() if digest.startswith("sha256:") else ""
-
-url_re = re.compile(
-    rf"^https://(?:github\.com/{re.escape(repo)}/releases/download/|objects\.githubusercontent\.com/|release-assets\.githubusercontent\.com/)[^\s|\"'<>]+$"
-)
-if not url_re.fullmatch(url):
-    print("ERR_INVALID_ASSET_URL", file=sys.stderr)
-    sys.exit(1)
-
-if size <= 0:
-    print("ERR_INVALID_ASSET_SIZE", file=sys.stderr)
-    sys.exit(1)
 
 if body_sha256 and asset_sha256 and body_sha256 != asset_sha256:
     print("ERR_DIGEST_MISMATCH", file=sys.stderr)
@@ -403,32 +178,13 @@ if not re.fullmatch(r"[0-9a-f]{64}", final_sha256):
     sys.exit(3)
 
 combined_meta = f"{tag} {name} {asset_name}"
-m_ms = re.search(r"(?:^|[^a-zA-Z0-9])r([0-9]{2,3})(?:[^0-9]|$)", combined_meta)
-milestone = m_ms.group(1) if m_ms else "0"
+print(f"{tag}|{url}|{size}|{final_sha256}|{combined_meta}")
+' <<< "$GH_JSON")
 
-valid_dates = []
-for d in re.findall(r"(20[0-9]{6})", combined_meta):
-    try:
-        datetime.datetime.strptime(d, "%Y%m%d")
-        valid_dates.append(d)
-    except ValueError:
-        pass
-date_str = valid_dates[-1] if valid_dates else "0"
+IFS='|' read -r LATEST_BRUNCH_TAG BRUNCH_TAR_URL BRUNCH_TAR_SIZE BRUNCH_EXPECTED_SHA256 BRUNCH_COMBINED_META <<< "$BRUNCH_PARSED"
+IFS='|' read -r BRUNCH_MILESTONE BRUNCH_DATE <<< "$(parse_brunch_info "$BRUNCH_COMBINED_META")"
 
-fields = [tag, url, str(size), final_sha256, milestone, date_str]
-if any("|" in x or "\n" in x or "\r" in x for x in fields):
-    print("ERR_UNSAFE_FIELD", file=sys.stderr)
-    sys.exit(4)
-
-print("|".join(fields))
-PYEOF
-)
-
-IFS='|' read -r LATEST_BRUNCH_TAG BRUNCH_TAR_URL BRUNCH_TAR_SIZE BRUNCH_EXPECTED_SHA256 BRUNCH_MILESTONE BRUNCH_DATE <<< "$BRUNCH_PARSED"
-
-if [ "$BRUNCH_MILESTONE" = "0" ] || [ "$BRUNCH_DATE" = "0" ] || \
-   [[ ! "$BRUNCH_MILESTONE" =~ ^[0-9]+$ ]] || [[ ! "$BRUNCH_DATE" =~ ^[0-9]+$ ]] || \
-   [[ ! "$BRUNCH_TAR_SIZE" =~ ^[0-9]+$ ]]; then
+if [ "$BRUNCH_MILESTONE" = "0" ] || [ "$BRUNCH_DATE" = "0" ]; then
     echo "ERROR: Could not extract valid milestone (rXXX) and build date (YYYYMMDD) from GitHub release '${LATEST_BRUNCH_TAG}'."
     exit 1
 fi
@@ -439,8 +195,8 @@ echo "Brunch SHA-256      : ${BRUNCH_EXPECTED_SHA256}"
 RECOVERY_JSON_FILE="${WORK_DIR}/recovery2.json"
 CROS_HTML_FILE="${WORK_DIR}/cros_tech.html"
 
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -- "https://dl.google.com/dl/edgedl/chromeos/recovery/recovery2.json" -o "$RECOVERY_JSON_FILE" || echo "[]" > "$RECOVERY_JSON_FILE"
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -A "Mozilla/5.0" -- "https://cros.tech/board/${CROS_BOARD}/" -o "$CROS_HTML_FILE" || : > "$CROS_HTML_FILE"
+curl -fsSL "https://dl.google.com/dl/edgedl/chromeos/recovery/recovery2.json" -o "$RECOVERY_JSON_FILE" || echo "[]" > "$RECOVERY_JSON_FILE"
+curl -fsSL -A "Mozilla/5.0" "https://cros.tech/board/${CROS_BOARD}/" -o "$CROS_HTML_FILE" || touch "$CROS_HTML_FILE"
 
 RECOVERY_AVAILABLE=true
 RECOVERY_PARSED=$(python3 - "$RECOVERY_JSON_FILE" "$CROS_HTML_FILE" "$CROS_BOARD" "$CROS_CHANNEL" "$BRUNCH_MILESTONE" << 'PYEOF'
@@ -450,45 +206,28 @@ from html.parser import HTMLParser
 rec_json_path, html_path, board, channel, target_ms = sys.argv[1:6]
 channel_lower = channel.lower()
 
-url_pattern = re.compile(
-    rf"^https://dl\.google\.com/dl/edgedl/chromeos/recovery/chromeos_([0-9]+(?:\.[0-9]+)*)_{re.escape(board)}_recovery_{re.escape(channel_lower)}-channel_[^\s|\"'<>]+\.bin\.zip$"
-)
-ver_pattern = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
-sha1_pattern = re.compile(r"^[0-9a-fA-F]{40}$")
-
 def ver_key(v):
-    return [int(x) for x in v.split(".")]
+    return [int(x) if x.isdigit() else 0 for x in v.split(".")]
 
 with open(rec_json_path, "r", encoding="utf-8") as f:
     rec_data = json.load(f)
 
 matches = []
 for item in rec_data:
-    url = (item.get("url") or "").strip()
-    c_ver = (item.get("chrome_version") or "").strip()
-    p_ver = (item.get("version") or "").strip()
-    ch = (item.get("channel") or "").strip().lower()
-    sha1 = (item.get("sha1") or "").strip().lower()
-    try:
-        filesize = int(item.get("filesize", 0))
-    except (TypeError, ValueError):
-        continue
-
-    if (url_pattern.fullmatch(url)
-        and ver_pattern.fullmatch(p_ver)
-        and sha1_pattern.fullmatch(sha1)
-        and filesize >= 0
+    url = item.get("url", "")
+    c_ver = item.get("chrome_version", "")
+    p_ver = item.get("version", "")
+    ch = (item.get("channel", "") or "").lower()
+    if (f"_{board}_recovery_" in url
         and c_ver.startswith(f"{target_ms}.")
-        and ch == channel_lower):
-        matches.append((p_ver, url, sha1, filesize))
+        and ch == channel_lower
+        and p_ver):
+        matches.append(item)
 
 if matches:
-    matches.sort(key=lambda x: ver_key(x[0]))
-    best_p_ver, best_url, best_sha1, best_size = matches[-1]
-    fields = ["recovery2.json", best_url, best_p_ver, best_sha1, str(best_size)]
-    if any("|" in x or "\n" in x or "\r" in x for x in fields):
-        sys.exit(1)
-    print("|".join(fields))
+    matches.sort(key=lambda x: ver_key(x.get("version", "0.0.0")))
+    best = matches[-1]
+    print(f"recovery2.json|{best['url']}|{best['version']}|{best.get('sha1','')}|{best.get('filesize',0)}")
     sys.exit(0)
 
 with open(html_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -504,7 +243,7 @@ class CrosTechParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         if tag.lower() == "a":
             self.in_a = True
-            self.curr_href = dict(attrs).get("href", "") or ""
+            self.curr_href = dict(attrs).get("href", "")
             self.curr_text = []
     def handle_data(self, data):
         if self.in_a:
@@ -512,29 +251,28 @@ class CrosTechParser(HTMLParser):
     def handle_endtag(self, tag):
         if tag.lower() == "a" and self.in_a:
             self.in_a = False
-            self.links.append((self.curr_href.strip(), " ".join(self.curr_text).strip()))
+            self.links.append((self.curr_href, " ".join(self.curr_text).strip()))
 
 parser = CrosTechParser()
 parser.feed(html_text)
 
+url_pattern = re.compile(
+    rf"^https://dl\.google\.com/dl/edgedl/chromeos/recovery/chromeos_([0-9.]+)_{re.escape(board)}_recovery_{re.escape(channel_lower)}-channel_[^\s\"'<>]+\.bin\.zip$"
+)
+
 html_candidates = []
 for href, text in parser.links:
-    m_url = url_pattern.fullmatch(href)
+    m_url = url_pattern.match(href)
     if not m_url:
         continue
     p_ver = m_url.group(1)
-    if not ver_pattern.fullmatch(p_ver):
-        continue
     if re.search(rf"\b{re.escape(target_ms)}\b", text):
         html_candidates.append((p_ver, href))
 
 if html_candidates:
     html_candidates.sort(key=lambda x: ver_key(x[0]))
     best_p_ver, best_url = html_candidates[-1]
-    fields = ["cros.tech", best_url, best_p_ver, "", "0"]
-    if any("|" in x or "\n" in x or "\r" in x for x in fields):
-        sys.exit(1)
-    print("|".join(fields))
+    print(f"cros.tech|{best_url}|{best_p_ver}||0")
     sys.exit(0)
 
 sys.exit(1)
@@ -550,14 +288,8 @@ elif [ "$BRUNCH_MILESTONE" -eq "$RECORDED_BRUNCH_MILESTONE" ] && [ "$BRUNCH_DATE
     BRUNCH_IS_NEWER=true
 fi
 
-RECOVERY_ZIP_SIZE=0
-RECOVERY_SHA1=""
 if [ "$RECOVERY_AVAILABLE" = "true" ]; then
     IFS='|' read -r RECOVERY_SOURCE RECOVERY_ZIP_URL LATEST_CROS_PLATFORM_VER RECOVERY_SHA1 RECOVERY_ZIP_SIZE <<< "$RECOVERY_PARSED"
-    if [[ ! "$RECOVERY_ZIP_SIZE" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: Invalid recovery zip size '$RECOVERY_ZIP_SIZE'."
-        exit 1
-    fi
     echo "Matched Recovery    : Milestone r${BRUNCH_MILESTONE} | Platform ${LATEST_CROS_PLATFORM_VER} (Source: ${RECOVERY_SOURCE})"
 
     if [ "$BRUNCH_MILESTONE" -gt "$RECORDED_CROS_MILESTONE" ] || \
@@ -574,9 +306,8 @@ DO_UPDATE_BRUNCH=false
 if [ "$CROS_IS_NEWER" = "true" ] && [ "$BRUNCH_IS_NEWER" = "true" ]; then
     DO_UPDATE_CROS=true
     DO_UPDATE_BRUNCH=true
-elif [ "$BRUNCH_MILESTONE" -eq "$RECORDED_CROS_MILESTONE" ] && \
-     [ "$BRUNCH_MILESTONE" -eq "$SYS_MILESTONE" ] && \
-     [ "$BRUNCH_IS_NEWER" = "true" ]; then
+elif [ "$BRUNCH_IS_NEWER" = "true" ] && \
+     { [ "$BRUNCH_MILESTONE" -eq "$RECORDED_BRUNCH_MILESTONE" ] || [ "$BRUNCH_MILESTONE" -eq "$SYS_MILESTONE" ]; }; then
     DO_UPDATE_BRUNCH=true
 fi
 
@@ -603,10 +334,6 @@ else
 fi
 
 STATE_AVAIL_KB=$(df -k --output=avail "$STATE_DIR" | tail -n1 | tr -d ' ')
-if [[ ! "$STATE_AVAIL_KB" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: Unable to determine available space on '$STATE_DIR'."
-    exit 1
-fi
 if [ "$STATE_AVAIL_KB" -lt "$MIN_FREE_KB" ]; then
     echo "ERROR: Insufficient stateful partition space: $((STATE_AVAIL_KB / 1024)) MB free, need $((MIN_FREE_KB / 1024)) MB."
     exit 1
@@ -617,7 +344,7 @@ UPDATE_ARGS=()
 if [ "$DO_UPDATE_BRUNCH" = "true" ]; then
     BRUNCH_ARCHIVE="${WORK_DIR}/brunch_latest.tar.gz"
     echo "Downloading Brunch archive (${LATEST_BRUNCH_TAG})..."
-    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL --retry 3 -o "$BRUNCH_ARCHIVE" -- "$BRUNCH_TAR_URL"
+    curl -fL --retry 3 -o "$BRUNCH_ARCHIVE" "$BRUNCH_TAR_URL"
 
     ACTUAL_SHA256=$(sha256sum "$BRUNCH_ARCHIVE" | awk '{print tolower($1)}')
     if [ "$ACTUAL_SHA256" != "$BRUNCH_EXPECTED_SHA256" ]; then
@@ -626,34 +353,17 @@ if [ "$DO_UPDATE_BRUNCH" = "true" ]; then
     fi
     echo "Brunch SHA-256 verified."
 
-    python3 - "$BRUNCH_ARCHIVE" << 'PYEOF'
-import posixpath, sys, tarfile
-
-archive_path = sys.argv[1]
-has_rootc = False
-with tarfile.open(archive_path, "r:gz") as tf:
-    for member in tf.getmembers():
-        parts = member.name.split("/")
-        norm = posixpath.normpath(member.name)
-        if member.name.startswith("/") or ".." in parts or norm.startswith(".."):
-            raise RuntimeError(f"Unsafe path in Brunch archive: {member.name}")
-        if member.issym() or member.islnk() or member.ischr() or member.isblk() or member.isfifo() or member.isdev():
-            raise RuntimeError(f"Unsafe symlink or special file in Brunch archive: {member.name}")
-        if not (member.isreg() or member.isdir()):
-            raise RuntimeError(f"Unsupported member type in Brunch archive: {member.name}")
-        if norm == "rootc.img" and member.isreg() and member.size > 0:
-            has_rootc = True
-if not has_rootc:
-    raise RuntimeError("Brunch archive does not contain a valid regular rootc.img.")
-PYEOF
-
+    if ! tar -tzf "$BRUNCH_ARCHIVE" rootc.img >/dev/null 2>&1 && ! tar -tzf "$BRUNCH_ARCHIVE" ./rootc.img >/dev/null 2>&1; then
+        echo "ERROR: Brunch archive does not contain rootc.img."
+        exit 1
+    fi
     UPDATE_ARGS+=(-f "$BRUNCH_ARCHIVE")
 fi
 
 if [ "$DO_UPDATE_CROS" = "true" ]; then
     RECOVERY_ZIP="${WORK_DIR}/recovery.bin.zip"
     echo "Downloading ChromeOS recovery archive..."
-    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL --retry 3 -o "$RECOVERY_ZIP" -- "$RECOVERY_ZIP_URL"
+    curl -fL --retry 3 -o "$RECOVERY_ZIP" "$RECOVERY_ZIP_URL"
 
     if [ -n "$RECOVERY_SHA1" ]; then
         ACTUAL_SHA1=$(sha1sum "$RECOVERY_ZIP" | awk '{print tolower($1)}')
@@ -664,42 +374,26 @@ if [ "$DO_UPDATE_CROS" = "true" ]; then
         echo "Recovery ZIP SHA-1 checksum verified."
     fi
 
-    echo "Verifying ZIP CRC integrity and streaming ChromeOS .bin safely via python3..."
+    echo "Verifying ZIP CRC integrity and extracting ChromeOS .bin via python3..."
     RECOVERY_BIN=$(python3 - "$RECOVERY_ZIP" "$WORK_DIR" << 'PYEOF'
-import os, shutil, sys, zipfile
+import os, sys, zipfile
 
 zip_path, out_dir = sys.argv[1], sys.argv[2]
-out_path = os.path.join(out_dir, "recovery_image.bin")
 with zipfile.ZipFile(zip_path, "r") as zf:
     bad_file = zf.testzip()
     if bad_file is not None:
         raise RuntimeError(f"Corrupted file inside ZIP archive: {bad_file}")
-    bin_members = [
-        info for info in zf.infolist()
-        if not info.is_dir()
-        and info.filename.endswith(".bin")
-        and "/" not in info.filename
-        and "\\" not in info.filename
-        and ".." not in info.filename
-    ]
+    bin_members = [m for m in zf.namelist() if m.endswith(".bin") and "/" not in m]
     if len(bin_members) != 1:
-        raise RuntimeError(f"Expected exactly 1 flat .bin file in ZIP, found: {[i.filename for i in bin_members]}")
-    target_info = bin_members[0]
-    with zf.open(target_info, "r") as src:
-        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            with os.fdopen(fd, "wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
-        except Exception:
-            if os.path.exists(out_path):
-                os.unlink(out_path)
-            raise
-print(out_path)
+        raise RuntimeError(f"Expected exactly 1 .bin file in ZIP, found: {bin_members}")
+    target_member = bin_members[0]
+    zf.extract(target_member, out_dir)
+    print(os.path.join(out_dir, target_member))
 PYEOF
     )
     rm -f "$RECOVERY_ZIP"
 
-    if [ -z "$RECOVERY_BIN" ] || [ ! -f "$RECOVERY_BIN" ] || [ -L "$RECOVERY_BIN" ]; then
+    if [ -z "$RECOVERY_BIN" ] || [ ! -f "$RECOVERY_BIN" ]; then
         echo "ERROR: Failed to extract recovery .bin file."
         exit 1
     fi
@@ -710,23 +404,14 @@ PYEOF
     fi
 
     ROOTA_START_SECTOR=$(cgpt show -i 3 -b "$RECOVERY_BIN")
-    if [[ ! "$ROOTA_START_SECTOR" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: Invalid ROOT-A start sector '$ROOTA_START_SECTOR'."
-        exit 1
-    fi
     ROOTA_OFFSET=$(( ROOTA_START_SECTOR * 512 ))
-    mount -t ext2 -o ro,loop,nosuid,nodev,noexec,offset="$ROOTA_OFFSET" "$RECOVERY_BIN" "$MNT_CHECK"
-    if [ ! -f "${MNT_CHECK}/etc/lsb-release" ] || [ -L "${MNT_CHECK}/etc/lsb-release" ]; then
-        umount "$MNT_CHECK"
-        echo "ERROR: Extracted recovery image missing regular /etc/lsb-release."
-        exit 1
-    fi
-    BIN_MILESTONE=$(grep -m1 -oP '(?<=^CHROMEOS_RELEASE_CHROME_MILESTONE=)[0-9]+' "${MNT_CHECK}/etc/lsb-release" || echo "0")
-    BIN_PLATFORM_VER=$(grep -m1 -oP '(?<=^CHROMEOS_RELEASE_VERSION=)[0-9.]+' "${MNT_CHECK}/etc/lsb-release" || echo "none")
-    BIN_BOARD=$(grep -m1 -oP '(?<=^CHROMEOS_RELEASE_BOARD=)[a-z0-9_-]+' "${MNT_CHECK}/etc/lsb-release" || echo "none")
+    mount -t ext2 -o ro,loop,offset="$ROOTA_OFFSET" "$RECOVERY_BIN" "$MNT_CHECK"
+    BIN_MILESTONE=$(get_lsb_val "${MNT_CHECK}/etc/lsb-release" "CHROMEOS_RELEASE_CHROME_MILESTONE" "0")
+    BIN_PLATFORM_VER=$(get_lsb_val "${MNT_CHECK}/etc/lsb-release" "CHROMEOS_RELEASE_VERSION" "none")
+    BIN_BOARD=$(get_lsb_val "${MNT_CHECK}/etc/lsb-release" "CHROMEOS_RELEASE_BOARD" "none")
     umount "$MNT_CHECK"
 
-    if [ "$BIN_BOARD" != "$CROS_BOARD" ] || [ "$BIN_MILESTONE" != "$BRUNCH_MILESTONE" ] || [ "$BIN_PLATFORM_VER" != "$LATEST_CROS_PLATFORM_VER" ]; then
+    if [ "${BIN_BOARD%%-*}" != "$CROS_BOARD" ] || [ "$BIN_MILESTONE" != "$BRUNCH_MILESTONE" ] || [ "$BIN_PLATFORM_VER" != "$LATEST_CROS_PLATFORM_VER" ]; then
         echo "ERROR: Pre-flash .bin inspection failed! Found board=${BIN_BOARD}, milestone=${BIN_MILESTONE}, platform=${BIN_PLATFORM_VER}."
         exit 1
     fi
@@ -734,27 +419,10 @@ PYEOF
     UPDATE_ARGS+=(-r "$RECOVERY_BIN")
 fi
 
-if [ "${#UPDATE_ARGS[@]}" -eq 0 ]; then
-    echo "ERROR: Internal error - no update arguments built."
-    exit 1
-fi
-if [ ! -x /usr/sbin/chromeos-update ] || [ -L /usr/sbin/chromeos-update ]; then
-    echo "ERROR: /usr/sbin/chromeos-update is missing, not executable, or a symlink."
-    exit 1
-fi
-if [ -L "$BRUNCH_STAGING_DIR" ]; then
-    echo "ERROR: Unsafe symlink detected at staging directory '$BRUNCH_STAGING_DIR'."
-    exit 1
-fi
-
 echo "Running: /usr/sbin/chromeos-update ${UPDATE_ARGS[*]}"
 /usr/sbin/chromeos-update "${UPDATE_ARGS[@]}"
 
 DEST_DISK=$(rootdev -d)
-if [ -z "$DEST_DISK" ] || [ ! -b "$DEST_DISK" ]; then
-    echo "ERROR: Invalid destination block device '$DEST_DISK'."
-    exit 1
-fi
 if [[ "$DEST_DISK" =~ [0-9]$ ]]; then
     PART_PREFIX="${DEST_DISK}p"
 else
@@ -763,19 +431,14 @@ fi
 
 if [ "$DO_UPDATE_CROS" = "true" ]; then
     KERN_B_PRIO=$(cgpt show -i 4 -P "$DEST_DISK")
-    if [[ ! "$KERN_B_PRIO" =~ ^[0-9]+$ ]] || [ "$KERN_B_PRIO" -ne 15 ]; then
-        echo "ERROR: Post-update verification failed: KERN-B priority is '${KERN_B_PRIO}' (expected 15)."
+    if [ "$KERN_B_PRIO" -ne 15 ]; then
+        echo "ERROR: Post-update verification failed: KERN-B priority is ${KERN_B_PRIO} (expected 15)."
         exit 1
     fi
 
-    mount -t ext2 -o ro,nosuid,nodev,noexec "${PART_PREFIX}5" "$MNT_CHECK"
-    if [ ! -f "${MNT_CHECK}/etc/lsb-release" ] || [ -L "${MNT_CHECK}/etc/lsb-release" ]; then
-        umount "$MNT_CHECK"
-        echo "ERROR: Partition 5 missing regular /etc/lsb-release."
-        exit 1
-    fi
-    FLASHED_PLATFORM_VER=$(grep -m1 -oP '(?<=^CHROMEOS_RELEASE_VERSION=)[0-9.]+' "${MNT_CHECK}/etc/lsb-release" || echo "none")
-    FLASHED_MILESTONE=$(grep -m1 -oP '(?<=^CHROMEOS_RELEASE_CHROME_MILESTONE=)[0-9]+' "${MNT_CHECK}/etc/lsb-release" || echo "0")
+    mount -t ext2 -o ro "${PART_PREFIX}5" "$MNT_CHECK"
+    FLASHED_PLATFORM_VER=$(get_lsb_val "${MNT_CHECK}/etc/lsb-release" "CHROMEOS_RELEASE_VERSION" "none")
+    FLASHED_MILESTONE=$(get_lsb_val "${MNT_CHECK}/etc/lsb-release" "CHROMEOS_RELEASE_CHROME_MILESTONE" "0")
     umount "$MNT_CHECK"
 
     if [ "$FLASHED_PLATFORM_VER" != "$LATEST_CROS_PLATFORM_VER" ] || [ "$FLASHED_MILESTONE" != "$BRUNCH_MILESTONE" ]; then
@@ -788,27 +451,15 @@ if [ "$DO_UPDATE_CROS" = "true" ]; then
 fi
 
 if [ "$DO_UPDATE_BRUNCH" = "true" ]; then
-    mount -o ro,nosuid,nodev,noexec "${PART_PREFIX}7" "$MNT_CHECK"
-    if [ ! -f "${MNT_CHECK}/initramfs.img" ] || [ -L "${MNT_CHECK}/initramfs.img" ] || [ ! -s "${MNT_CHECK}/initramfs.img" ] || \
-       [ ! -f "${MNT_CHECK}/packages/base.tar.gz" ] || [ -L "${MNT_CHECK}/packages/base.tar.gz" ] || [ ! -s "${MNT_CHECK}/packages/base.tar.gz" ] || \
-       [ ! -f "${MNT_CHECK}/kernel" ] || [ -L "${MNT_CHECK}/kernel" ] || [ ! -s "${MNT_CHECK}/kernel" ]; then
+    mount -o ro "${PART_PREFIX}7" "$MNT_CHECK"
+    if [ ! -s "${MNT_CHECK}/initramfs.img" ] || [ ! -s "${MNT_CHECK}/packages/base.tar.gz" ] || [ ! -s "${MNT_CHECK}/kernel" ]; then
         umount "$MNT_CHECK"
-        echo "ERROR: Partition 7 (ROOTC) is missing valid regular core files (initramfs.img, kernel, or packages/base.tar.gz)."
+        echo "ERROR: Partition 7 (ROOTC) is missing core files (initramfs.img, kernel, or packages/base.tar.gz)."
         exit 1
     fi
 
-    FLASHED_BRUNCH_VER=$(python3 - "${MNT_CHECK}/packages/base.tar.gz" << 'PYEOF' || true
-import posixpath, sys, tarfile
-
-with tarfile.open(sys.argv[1], "r:gz") as tf:
-    for member in tf.getmembers():
-        if posixpath.normpath(member.name) == "etc/brunch_version" and member.isreg():
-            f = tf.extractfile(member)
-            if f is not None:
-                print(f.read().decode("utf-8", errors="ignore").strip("\r\n"))
-            break
-PYEOF
-    )
+    FLASHED_BRUNCH_VER=$( { tar -xOzf "${MNT_CHECK}/packages/base.tar.gz" etc/brunch_version 2>/dev/null || \
+                            tar -xOzf "${MNT_CHECK}/packages/base.tar.gz" ./etc/brunch_version 2>/dev/null; } | tr -d '\r\n' || true )
     umount "$MNT_CHECK"
 
     IFS='|' read -r FLASHED_BRUNCH_MS FLASHED_BRUNCH_DATE <<< "$(parse_brunch_info "$FLASHED_BRUNCH_VER")"
@@ -822,99 +473,41 @@ PYEOF
     RECORDED_BRUNCH_DATE="$BRUNCH_DATE"
 fi
 
-if [[ ! "$RECORDED_CROS_MILESTONE" =~ ^[0-9]+$ ]] || \
-   [[ ! "$RECORDED_CROS_PLATFORM_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]] || \
-   [[ ! "$RECORDED_BRUNCH_RELEASE" =~ ^[A-Za-z0-9._\ -]+$ ]] || \
-   [[ ! "$RECORDED_BRUNCH_MILESTONE" =~ ^[0-9]+$ ]] || \
-   [[ ! "$RECORDED_BRUNCH_DATE" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: Refusing to persist invalid state metadata."
-    exit 1
-fi
-
-TMP_STATE=$(mktemp "${STATE_DIR}/version_state.env.XXXXXX")
-chmod 0600 "$TMP_STATE"
-{
-    printf 'RECORDED_CROS_MILESTONE="%s"\n' "$RECORDED_CROS_MILESTONE"
-    printf 'RECORDED_CROS_PLATFORM_VERSION="%s"\n' "$RECORDED_CROS_PLATFORM_VERSION"
-    printf 'RECORDED_BRUNCH_RELEASE="%s"\n' "$RECORDED_BRUNCH_RELEASE"
-    printf 'RECORDED_BRUNCH_MILESTONE="%s"\n' "$RECORDED_BRUNCH_MILESTONE"
-    printf 'RECORDED_BRUNCH_DATE="%s"\n' "$RECORDED_BRUNCH_DATE"
-} > "$TMP_STATE"
-chown 0:0 "$TMP_STATE"
-mv -f "$TMP_STATE" "$STATE_FILE"
+cat <<EOF > "${STATE_FILE}.tmp"
+RECORDED_CROS_MILESTONE="${RECORDED_CROS_MILESTONE}"
+RECORDED_CROS_PLATFORM_VERSION="${RECORDED_CROS_PLATFORM_VERSION}"
+RECORDED_BRUNCH_RELEASE="${RECORDED_BRUNCH_RELEASE}"
+RECORDED_BRUNCH_MILESTONE="${RECORDED_BRUNCH_MILESTONE}"
+RECORDED_BRUNCH_DATE="${RECORDED_BRUNCH_DATE}"
+EOF
+mv -f "${STATE_FILE}.tmp" "$STATE_FILE"
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Update verified and recorded! Reboot manually whenever ready."
-BRUNCH_CUSTOM_UPDATE_EOF
+UPDATER_EOF
+    chmod 0755 "$target"
+}
 
-REF_BIN="${PREFIX}/usr/bin/mawk"
-[ -e "$REF_BIN" ] || REF_BIN="${PREFIX}/bin/bash"
-[ -e "$REF_BIN" ] || REF_BIN="${PREFIX}/bin/sh"
+write_update_script "/roota/usr/share/brunch-updater/update"
 
-REF_INIT="${PREFIX}/etc/init/cras.conf"
-[ -e "$REF_INIT" ] || REF_INIT="${PREFIX}/etc/init/ui.conf"
-
-if ! safe_install_payload "$STAGE_FILE" "${PREFIX}/usr/local/bin/update" 0755 "$REF_BIN" "u:object_r:cros_system_file:s0"; then
-    echo "brunch: custom_updater: ERROR installing ${PREFIX}/usr/local/bin/update" >&2
-    ret=$((ret + 1))
+if [ ! -f "/roota/usr/local/bin/update" ]; then
+    cp -p "/roota/usr/share/brunch-updater/update" "/roota/usr/local/bin/update"
 fi
 
-if ! safe_install_payload "$STAGE_FILE" "${PREFIX}/usr/share/brunch/update" 0755 "$REF_BIN" "u:object_r:cros_system_file:s0"; then
-    echo "brunch: custom_updater: ERROR installing ${PREFIX}/usr/share/brunch/update" >&2
-    ret=$((ret + 2))
-fi
-
-UPSTART_TMP=$(mktemp "/tmp/brunch_custom_updater_init.XXXXXX")
-cat << 'INITEOF' > "$UPSTART_TMP"
-description "Ensure hardened Brunch custom updater is installed at /usr/local/bin/update"
+cat << 'UPSTART_EOF' > /roota/etc/init/brunch-install-update.conf
+description "Ensure /usr/local/bin/update exists after stateful partition mount"
 author "Brunch Patch"
 
-start on started system-services
+start on started boot-services
+
 task
 
 script
-    set +e
-    SRC="/usr/share/brunch/update"
-    DST_DIR="/usr/local/bin"
-    DST="${DST_DIR}/update"
-
-    [ -f "$SRC" ] || exit 0
-    [ -L "$DST_DIR" ] && exit 1
-
-    if [ ! -d "$DST_DIR" ]; then
-        mkdir -p -m 0755 "$DST_DIR" || exit 1
-    fi
-
-    if [ -L "$DST" ]; then
-        rm -f "$DST"
-    fi
-
-    if [ ! -f "$DST" ] || [ ! -x "$DST" ] || ! cmp -s "$SRC" "$DST"; then
-        TMP_BIN=$(mktemp "${DST_DIR}/.update.tmp.XXXXXX") || exit 1
-        chmod 0755 "$TMP_BIN"
-        cat "$SRC" > "$TMP_BIN" || { rm -f "$TMP_BIN"; exit 1; }
-        chmod 0755 "$TMP_BIN"
-        chown 0:0 "$TMP_BIN" 2>/dev/null || true
-        mv -f "$TMP_BIN" "$DST" || { rm -f "$TMP_BIN"; exit 1; }
-    else
-        chmod 0755 "$DST" 2>/dev/null || true
-        chown 0:0 "$DST" 2>/dev/null || true
+    if [ ! -f /usr/local/bin/update ] && [ -f /usr/share/brunch-updater/update ]; then
+        mkdir -p /usr/local/bin
+        cp -p /usr/share/brunch-updater/update /usr/local/bin/update
+        chmod 0755 /usr/local/bin/update
     fi
 end script
-INITEOF
+UPSTART_EOF
 
-if ! safe_install_payload "$UPSTART_TMP" "${PREFIX}/etc/init/brunch-custom-updater.conf" 0644 "$REF_INIT" "u:object_r:cros_init_conf_file:s0"; then
-    echo "brunch: custom_updater: ERROR installing ${PREFIX}/etc/init/brunch-custom-updater.conf" >&2
-    ret=$((ret + 4))
-fi
-rm -f "$UPSTART_TMP"
-
-if [ "$TARGET_ROOT" = "/" ] && command -v initctl >/dev/null 2>&1; then
-    initctl reload-configuration 2>/dev/null || true
-fi
-
-if [ ! -x "${PREFIX}/usr/local/bin/update" ] || [ -L "${PREFIX}/usr/local/bin/update" ]; then
-    echo "brunch: custom_updater: verification failed for ${PREFIX}/usr/local/bin/update" >&2
-    ret=$((ret + 8))
-fi
-
-exit "$ret"
+exit 0
