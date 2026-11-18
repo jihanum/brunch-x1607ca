@@ -366,12 +366,16 @@ UMOUNT_USR_LOCAL=0
 UMOUNT_STATEFUL=0
 if [ ! -x "$TARGET_ROOT/usr/local/bin/python3" ]; then
  mkdir -p /tmp/brunch_stateful_p1
- if mount -o ro /dev/nvme0n1p1 /tmp/brunch_stateful_p1 2>/dev/null; then
-     UMOUNT_STATEFUL=1
-     if [ -d /tmp/brunch_stateful_p1/dev_image ]; then
-         mount --bind /tmp/brunch_stateful_p1/dev_image "$TARGET_ROOT/usr/local" 2>/dev/null && UMOUNT_USR_LOCAL=1
+ for STATEFUL_PART in /dev/nvme0n1p1 /dev/sdz1; do
+     if [ -b "$STATEFUL_PART" ] && mount -o ro "$STATEFUL_PART" /tmp/brunch_stateful_p1 2>/dev/null; then
+         if [ -d /tmp/brunch_stateful_p1/dev_image ]; then
+             UMOUNT_STATEFUL=1
+             mount --bind /tmp/brunch_stateful_p1/dev_image "$TARGET_ROOT/usr/local" 2>/dev/null && UMOUNT_USR_LOCAL=1
+             break
+         fi
+         umount /tmp/brunch_stateful_p1 2>/dev/null
      fi
- fi
+ done
 fi
 
 if [ -x "$TARGET_ROOT/usr/local/bin/python3" ]; then
