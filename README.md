@@ -2,6 +2,8 @@
 
 A fork of [kk1987/brunch-lunar-lake](https://github.com/kk1987/brunch-lunar-lake)
 
+Note: "sudo dev_install" is required!
+
 Tested and patched for the ASUS Vivobook 16 (X1607CA model with Intel Ultra 200 Series CPU)
 
 ## What this fork adds
